@@ -141,6 +141,19 @@ def build_retrieval_forward(cfg: Any) -> SimpleNamespace:
                                 lnZ_ref=lnZ_ref, c_o_ref=c_o_ref, return_diag=True,
                                 warm_cap=True)
 
+    def chem_solve_warm_diag_full(chem_theta, y_warm, lnZ_ref, c_o_ref):
+        """chem_solve_warm_diag WITHOUT the mutation cap: runs under the cold
+        count_max. For the INIT gradient pass only (pipeline._init_state phase 2):
+        its inputs are phase-1 SURVIVORS re-certifying from their own converged
+        columns -- proven-convergent states, not disposable proposals -- and a
+        marginal survivor (slow phase-1 converger, stall-fallback certification) can
+        legitimately need more than warm_count_max accepted steps to re-certify.
+        Capping them mislabels healthy particles as blown forwards (NAS job 64854:
+        5/96 survivors gated at 1500 -> spurious 'RT/AD problem' RuntimeError)."""
+        return chem.converged_y(chem_theta, warm_y=y_warm,
+                                lnZ_ref=lnZ_ref, c_o_ref=c_o_ref, return_diag=True,
+                                warm_cap=False)
+
     def aux_from_y(y, chem_theta):
         """ART-grid primal profiles aux = (vmr dict, vmr_h2, vmr_he, T_art, mmw_art)
         from an absolute column y (nz, ni). Differentiable and cheap (normalize +
@@ -189,6 +202,7 @@ def build_retrieval_forward(cfg: Any) -> SimpleNamespace:
         chem_solve_cold_diag=chem_solve_cold_diag,
         chem_solve_warm=chem_solve_warm,
         chem_solve_warm_diag=chem_solve_warm_diag,
+        chem_solve_warm_diag_full=chem_solve_warm_diag_full,
         aux_from_y=aux_from_y,
         y_baseline=np.asarray(chem.y0, dtype=np.float64),
         nz=int(chem.nz), ni=int(chem.ni),

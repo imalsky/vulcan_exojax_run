@@ -94,6 +94,26 @@ def test_move_vg_rejects_nonconverged_without_raising(smoke):
     assert np.all(smoke["L_gated"] <= -1.0e29)       # ... and it is rejected (MH -inf)
 
 
+def test_init_eval_is_uncapped(smoke):
+    """The INIT gradient path must NOT run under the mutation cap: a phase-1 survivor
+    that needs more than warm_count_max steps to re-certify is a healthy particle, not
+    a doomed proposal (NAS job 64854 regression: 5/96 survivors gated at the warm cap
+    -> spurious 'crippled cloud' RuntimeError). chem_solve_warm_diag_full must run the
+    UNCAPPED runner: from the baseline column (which cannot certify in either budget
+    here) the capped solve stops at WARM_CMAX while the full solve marches on to the
+    cold cap."""
+    pipe = smoke["pipe"]
+    assert pipe.batch_eval_init_vg is not pipe.batch_eval_move_vg
+    U = pipe.sample_prior_u(jax.random.PRNGKey(1), 1)
+    C_ = jax.vmap(pipe.theta_from_u)(U)[:, : pipe.n_chem_tp]
+    Y0, refs0 = P._blank_state(pipe, 1)
+    _y, ac_cap = pipe.fwd.chem_solve_warm_diag(C_[0], Y0[0], refs0[0, 0], refs0[0, 1])
+    _y, ac_full = pipe.fwd.chem_solve_warm_diag_full(C_[0], Y0[0], refs0[0, 0], refs0[0, 1])
+    assert int(ac_cap) <= WARM_CMAX + 1
+    assert int(ac_full) > WARM_CMAX + 1          # kept going past the mutation cap
+    assert int(ac_full) >= COLD_CMAX             # ... all the way to the cold cap
+
+
 def test_gate_is_load_bearing(smoke):
     # the ungated primal likelihood (move_l) carries these non-converged proposals as
     # FINITE MH candidates; the gated gradient evaluator (move_vg) rejects them. Every

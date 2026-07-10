@@ -108,10 +108,24 @@ cold-init gradient that already fit) and the sampler logic (14/14 unit tests), t
 reproduced on the smoke pipeline. **Fix:** `retrieval_forward.chem_solve_warm_diag` (warm
 twin of `chem_solve_cold_diag`) reports the warm accept_count, and
 `pipeline._make_batch_eval` (warm+want_grad) gates `L→-inf`, drops it from `n_bad`, and
-pins its carried state when `accept_count >= count_max`. Cold init phase 2 shares the same
-evaluator but is unaffected (its survivors re-converge at ~zero increment, so
-`accept_count ≪ count_max`). Regression-tested in `tests/test_warm_reject.py` (3 tests on
-the real smoke pipeline); full suite 17/17 green.
+pins its carried state when `accept_count >= count_max`. Regression-tested in
+`tests/test_warm_reject.py` on the real smoke pipeline.
+
+**Init phase 2 must run UNCAPPED (learned from NAS job 64854, 2026-07-10).** The claim
+that phase 2 "is unaffected because survivors re-converge at ~zero increment" was WRONG
+once the cap tightened to `warm_count_max=1500`: a marginal survivor (slow phase-1
+converger / stall-fallback certification) can need >1500 accepted steps just to
+RE-CERTIFY convergence from its own converged column (the criterion is time-based --
+unchanged vs the run at half its integrated time -- so a fresh warm restart of a wobbly
+column re-pays the certification window). Job 64854: 5/96 healthy survivors gated at the
+cap -> mislabeled "non-finite forward" -> spurious "RT/AD problem" RuntimeError; the tell
+was phase-2 wall time sitting exactly at the cap (~780 s ≈ 1500 steps). Fix: phase 2 uses
+`batch_eval_init_vg` (`_make_batch_eval(..., mutation_cap=False)` ->
+`chem_solve_warm_diag_full`, gated at the cold `count_max`) -- survivors are
+proven-convergent particles, not disposable proposals. Mutation proposals keep the
+`warm_count_max` cap unchanged. Cost: phase 2 can run to ~5000 steps (~40 min) instead of
+~13 min when a marginal survivor is present -- once per run, and correctness is not
+negotiable. Regression: `test_warm_reject.py::test_init_eval_is_uncapped`.
 
 ## Mutation sweep cost — the <24 h rework (2026-07-09, after job 64745)
 

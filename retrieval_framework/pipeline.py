@@ -508,7 +508,7 @@ def build_pipeline(cfg: C.Config) -> Pipeline:
         return val, g, bad_grad
 
     def _make_batch_eval(mode: str, want_grad: bool, diag: bool = False,
-                         want_dy: bool = False):
+                         want_dy: bool = False, mutation_cap: bool = True):
         """Build eval(U, Y, refs) -> (L, G, Y_new, refs_new, n_bad_grad, DY) when
         want_grad, else (L, Y_new, refs_new) [+ worst_accept when diag]; all
         (N,)-batched. ``n_bad_grad`` counts finite-likelihood/non-finite-gradient AD
@@ -533,10 +533,16 @@ def build_pipeline(cfg: C.Config) -> Pipeline:
         warm = (mode == "warm")
         assert not (diag and (warm or want_grad)), "diag is cold+no-grad only"
         assert not (want_dy and not want_grad), "want_dy needs the jvp lanes (want_grad)"
-        # convergence gate for the warm mutation grad: the warm solver itself is capped
-        # at warm_count_max (a proposal that hasn't converged there is doomed -- reject
-        # it instead of dragging the lockstep batch to the cold count_max)
-        wcmax = int(fwd.chem.warm_count_max)
+        # Convergence gate for the warm grad. mutation_cap=True (the MALA proposal
+        # path): the warm solver is capped at warm_count_max -- a proposal that hasn't
+        # converged there is doomed, reject it instead of dragging the lockstep batch
+        # to the cold count_max. mutation_cap=False (the INIT phase-2 path): phase-1
+        # SURVIVORS re-certify from their own converged columns -- proven-convergent
+        # states, not disposable proposals -- and a marginal survivor can need more
+        # than warm_count_max steps to re-certify; run them under the cold count_max
+        # (NAS job 64854: the cap gated 5/96 healthy survivors -> spurious raise).
+        wcmax = (int(fwd.chem.warm_count_max) if mutation_cap
+                 else int(fwd.chem.count_max))
 
         def _solve(c, yw, rf):
             return (fwd.chem_solve_warm(c, yw, rf[0], rf[1]) if warm
@@ -552,11 +558,14 @@ def build_pipeline(cfg: C.Config) -> Pipeline:
             # time per sweep). It is integer-valued (no tangent); stop_gradient + cast
             # keeps the jvp output pytree all-float. eval_batch rejects an exhausted
             # proposal (-inf L, MH rejection) and drops it from the gradient-health
-            # tally. The cold grad path (init phase 2) runs on already-converged
-            # survivors; its accept-count slot is a constant 0 (never gates).
-            if warm:
+            # tally. The cold grad path's accept-count slot is a constant 0 (never
+            # gates); init phase 2 is warm but UNCAPPED (mutation_cap=False above).
+            if warm and mutation_cap:
                 def _solve_ac(c, yw, rf):
                     return fwd.chem_solve_warm_diag(c, yw, rf[0], rf[1])
+            elif warm:
+                def _solve_ac(c, yw, rf):
+                    return fwd.chem_solve_warm_diag_full(c, yw, rf[0], rf[1])
             else:
                 def _solve_ac(c, yw, rf):
                     return fwd.chem_solve_cold(c), jnp.zeros((), jnp.int32)
@@ -677,6 +686,12 @@ def build_pipeline(cfg: C.Config) -> Pipeline:
         batch_eval_move_vg=_make_batch_eval(
             chem_mode, True,
             want_dy=bool(cfg.warm_extrapolate) and chem_mode == "warm"),
+        # init phase 2: same evaluator WITHOUT the mutation cap (survivors re-certify
+        # under the cold count_max; see _make_batch_eval's mutation_cap note)
+        batch_eval_init_vg=_make_batch_eval(
+            chem_mode, True,
+            want_dy=bool(cfg.warm_extrapolate) and chem_mode == "warm",
+            mutation_cap=False),
         batch_eval_move_l=_make_batch_eval(chem_mode, False),
         # observations injected by set_observations
         obs_depth_jax=None, obs_sigma_jax=None, obs_depth=None, obs_sigma=None, flux_true=None,
@@ -848,11 +863,15 @@ def _init_state(pipe: Pipeline, U, target_n: Optional[int] = None):
     problem). Wall time is one lockstep max over the draws, count_max-bounded; widening
     the draw to oversample is ~free because the slowest draw dominates regardless.
 
-    Phase 2 -- gradient pass through the MOVE evaluator on the target_n SURVIVORS ONLY
-    (the expensive jvp/vjp lanes are never paid on a rejected draw): each survivor
-    re-converges from its own phase-1 column (~count_min steps) and the jvp lanes ride
-    that short warm map -- the SAME map every subsequent MALA proposal uses, so the
-    carried (L, G) are consistent with the rest of the run by construction.
+    Phase 2 -- gradient pass on the target_n SURVIVORS ONLY (the expensive jvp/vjp
+    lanes are never paid on a rejected draw): each survivor re-certifies from its own
+    phase-1 column and the jvp lanes ride that warm map -- the SAME map every
+    subsequent MALA proposal uses, so the carried (L, G) are consistent with the rest
+    of the run by construction. Phase 2 runs UNCAPPED (batch_eval_init_vg, cold
+    count_max, not warm_count_max): typical survivors re-certify in a few hundred
+    steps, but a marginal one (slow phase-1 converger / stall-fallback certification)
+    can need more than the mutation cap, and it is a proven-convergent particle, not a
+    disposable proposal (NAS job 64854: the cap gated 5/96 healthy survivors).
 
     Survivors are fully converged, so phase 2 must be SOUND -- there is no MH rejection
     to absorb failures here. A non-finite likelihood or flagged gradient pathology on a
@@ -881,13 +900,18 @@ def _init_state(pipe: Pipeline, U, target_n: Optional[int] = None):
             raise RuntimeError(
                 f"{int(dead.sum())}/{len(L_np)} SURVIVING particle(s) produced a "
                 f"non-finite forward model at {where} (indices "
-                f"{np.flatnonzero(dead).tolist()}). These already converged in phase 1, "
-                "so this is an RT/AD problem, not a hard prior corner -- refusing to "
-                "start the SMC on a crippled cloud.")
+                f"{np.flatnonzero(dead).tolist()}). These already converged in phase 1 "
+                "and phase 2 runs UNCAPPED (cold count_max), so this is either an "
+                "RT/AD problem or a column that certifies cold but cannot re-certify "
+                "warm within count_max -- refusing to start the SMC on a crippled "
+                "cloud either way.")
 
     if not hasattr(pipe, "_init_l_jit"):
         pipe._init_l_jit = jax.jit(cold_l_init)
-        pipe._init_mv_jit = jax.jit(move_vg)
+        # phase 2 uses the UNCAPPED move evaluator where the pipeline provides one:
+        # survivors re-certify under the cold count_max, not the mutation-proposal cap
+        # (stub pipes have no cap distinction and keep move_vg)
+        pipe._init_mv_jit = jax.jit(getattr(pipe, "batch_eval_init_vg", None) or move_vg)
 
     # ---- phase 1: cold likelihood over the full (oversampled) draw ----
     t0 = time.perf_counter()
