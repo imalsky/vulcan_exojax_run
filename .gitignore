@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.DS_Store
+
+# Large opacity/line-list caches -- NOT tracked. ExoJax downloads HITRAN line lists
+# and CIA tables on first use (via the NAS proxy on HPC; see run_nas_w39b.pbs), and
+# the ExoMol CO cache regenerates the same way. Total ~360 MB that git should not carry.
+data/exojax_linelists/
+data/opacity_cache/
+
+# Run outputs (posteriors, checkpoints, logs, PBS job logs) -- regenerated per run
+runs/*/data/
+runs/*/logs/
+*.nsys-rep
+
+# Editor / OS noise
+.vscode/
+.idea/

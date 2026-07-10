@@ -1,0 +1,1229 @@
+"""Pipeline: assemble the theta-space forward into a bounded-prior u-space posterior,
+and run a self-contained adaptive-tempered SMC with a preconditioned forward-mode-jvp
+MALA mutation kernel.
+
+This mirrors the SWAMPE retrieval (BlackJAX adaptive-tempered SMC + custom
+forward-mode-gradient MALA + per-stage step/preconditioner adaptation + per-stage
+checkpointing), but the SMC core is implemented directly in JAX so the code has NO
+BlackJAX dependency -- the VULCAN-JAX conda env does not ship it, and a pip-install on
+the HPC is fragile. The algorithm is the standard Del Moral (2006) resample-move SMC:
+
+  each stage:  (1) pick the next inverse-temperature beta' by ESS bisection,
+               (2) reweight + accumulate the log-evidence increment,
+               (3) systematic resample,
+               (4) mutate with `num_mcmc_steps` preconditioned-MALA sweeps at the
+                   tempered target log_prior_u(u) + beta'*loglik(u),
+               (5) Robbins-Monro adapt the step size + refresh the diagonal
+                   preconditioner from the mutated cloud,
+               (6) atomically checkpoint.
+
+The MALA gradient is the crux: the VULCAN-JAX runner's `lax.while_loop` supports jvp but
+not vjp, so the likelihood gradient is built from forward-mode jvps (one per u-dimension,
+vmapped) and exposed to `jax.value_and_grad` through a `custom_vjp` -- exactly the SWAMPE
+trick -- so no reverse-mode tape is ever taped through the chemistry solve.
+
+GH200 batched architecture (2026-07-06 rework -- see README section C):
+the per-particle gradient functions above are kept for validation, but the SMC hot path
+uses STAGED batched evaluators that split the chain at the chemistry/RT boundary:
+
+  * chemistry: forward-mode jvp lanes for the n_chem_tp dims only, with ALL particles
+    batched into ONE vmapped `lax.while_loop` (per-lane state is ~MB, so width is nearly
+    free -- wide batches are what keep the GPU busy instead of launch-latency-bound);
+  * RT: ONE reverse-mode vjp per particle (legal -- there is no while_loop inside the
+    ExoJax RT), `lax.map`-chunked over particles because PreMODIT tangent/tape
+    intermediates cost ~GB per lane (this is what OOM'd the old all-in-one design at
+    1.5 TiB); a single backward pass replaces the old 6 forward tangents + 3-dim jacfwd;
+  * offsets / noise-inflation: analytic (unchanged).
+
+The mutation kernel additionally CARRIES each particle's converged chemistry column and
+warm-starts every proposal's solve from it with incremental lnZ/C-O scaling (the
+validated continuation pattern) -- ~count_min-step re-converges instead of full cold
+two-stage solves. `smc_chem_mode="cold"` restores the published solve-from-baseline map.
+"""
+from __future__ import annotations
+
+import logging
+import math
+import time
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+import numpy as np
+
+from retrieval_framework import config_schema as C
+from retrieval_framework import observations as OBS
+# NOTE: retrieval_forward (-> vulcan_chem -> VULCAN-JAX env setup + chdir) is imported
+# LAZILY inside build_pipeline, so the SMC core + u-space machinery in this module can
+# be unit-tested (tests/test_smc_gaussian.py) without touching the heavy stack.
+
+import jax
+import jax.numpy as jnp
+
+logger = logging.getLogger("retrieval")
+
+
+# =============================================================================
+# Pipeline container
+# =============================================================================
+class Pipeline:
+    def __init__(self, **kw: Any) -> None:
+        self.__dict__.update(kw)
+
+
+def save_npz(path: Path, **arrays: Any) -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez(path, **arrays)
+
+
+def make_uspace(specs, dtype):
+    """Bounded-box prior <-> unconstrained u-space (the SWAMPE transform).
+
+    z = sigmoid(u) in (0,1); "uniform" -> lo + (hi-lo) z, "log10_uniform" ->
+    10**(log lo + (log hi - log lo) z). log_prior_u carries the sigmoid Jacobian so
+    the induced prior on theta is exactly (log-)uniform on the box.
+
+    Returns (theta_from_u, log_prior_u, sample_prior_u). Module-level so the SMC core
+    can be unit-tested without the VULCAN/ExoJax stack.
+    """
+    n_dim = len(specs)
+    prior_lo = jnp.asarray([s.lo for s in specs], dtype=dtype)
+    prior_hi = jnp.asarray([s.hi for s in specs], dtype=dtype)
+    is_log10 = jnp.asarray([1.0 if s.prior_type == "log10_uniform" else 0.0 for s in specs],
+                           dtype=dtype)
+    lo_lin, span_lin = prior_lo, prior_hi - prior_lo
+    lo_log = jnp.log10(jnp.clip(prior_lo, 1e-300, None))
+    span_log = jnp.log10(jnp.clip(prior_hi, 1e-300, None)) - lo_log
+
+    def theta_from_u(u):
+        u = jnp.asarray(u, dtype=dtype)
+        z = jax.nn.sigmoid(u)
+        theta_lin = lo_lin + span_lin * z
+        theta_log = 10.0 ** (lo_log + span_log * z)
+        return jnp.where(is_log10 > 0.5, theta_log, theta_lin)
+
+    def log_prior_u(u):
+        u = jnp.asarray(u, dtype=dtype)
+        return jnp.sum(jax.nn.log_sigmoid(u) + jax.nn.log_sigmoid(-u))
+
+    def sample_prior_u(rng_key, n_particles):
+        eps = jnp.asarray(1e-6, dtype=dtype)
+        z = jax.random.uniform(rng_key, (n_particles, n_dim), dtype=dtype,
+                               minval=eps, maxval=1.0 - eps)
+        return jnp.log(z) - jnp.log1p(-z)
+
+    return theta_from_u, log_prior_u, sample_prior_u
+
+
+def _tree_dot(a, b):
+    """Sum of leaf-wise vdots of two pytrees with identical structure (the tangent /
+    cotangent contraction of the split chain rule)."""
+    la = jax.tree_util.tree_leaves(a)
+    lb = jax.tree_util.tree_leaves(b)
+    return sum(jnp.vdot(x, y) for x, y in zip(la, lb))
+
+
+def _map_chunked(fn, args, chunk):
+    """vmap ``fn`` over the leading axis of every leaf of ``args`` (a pytree of stacked
+    per-particle inputs), running ``lax.map`` over padded chunks of ``chunk`` particles
+    to bound peak memory. ``chunk<=0`` (or >= n) is a single all-particles vmap.
+    Identical results to the plain vmap for any chunk (padding rows are dropped)."""
+    leaves = jax.tree_util.tree_leaves(args)
+    n = int(leaves[0].shape[0])
+    vfn = jax.vmap(fn)
+    if chunk <= 0 or chunk >= n:
+        return vfn(args)
+    n_pad = (-n) % chunk
+    if n_pad:
+        args = jax.tree_util.tree_map(
+            lambda x: jnp.concatenate([x, x[:n_pad]], axis=0), args)
+    args = jax.tree_util.tree_map(
+        lambda x: x.reshape((-1, chunk) + x.shape[1:]), args)
+    out = jax.lax.map(vfn, args)
+    return jax.tree_util.tree_map(
+        lambda x: x.reshape((-1,) + x.shape[2:])[:n], out)
+
+
+def build_pipeline(cfg: C.Config) -> Pipeline:
+    """Build the forward, observation operators, u-space prior/likelihood, and the
+    forward-mode-gradient likelihood wrapper. No inference, no file IO.
+
+    IMPORTANT (trace-time baking): the likelihood closes over ``pipe.obs_depth_jax`` /
+    ``pipe.obs_sigma_jax``; the first jitted call bakes them in as constants. Call
+    ``pipe.set_observations`` exactly ONCE, before any inference/tuning call, and never
+    swap observations afterwards in the same process.
+    """
+    C.validate_config(cfg)
+    from retrieval_framework import retrieval_forward as RF   # lazy: pulls in vulcan_chem -> VULCAN-JAX + exojax
+    dtype = jnp.float64 if bool(jax.config.jax_enable_x64) else jnp.float32
+    npdtype = np.float64
+
+    # ---- forward model (VULCAN chemistry + ExoJax Guillot T-P + RT) ----
+    t0 = time.perf_counter()
+    fwd = RF.build_retrieval_forward(cfg)
+    logger.info(f"Built forward in {time.perf_counter()-t0:.1f}s | native n_nu={fwd.wl_um.size} "
+                f"nz={cfg.nz} n_tp={fwd.n_tp} molecules={list(cfg.molecules)}")
+
+    # ---- T-P validity window (NO clipping) ----------------------------------
+    # The Guillot profile is drawn raw (tp_profile no longer clips). A draw whose T-P
+    # leaves the modelable window [tp_model.T_min, tp_model.T_max] on the ART pressure
+    # grid (the widest P range; the chemistry grid is a subset) is REJECTED, not bent
+    # into range: rejection-sampled away at the prior (init redraw) and given -inf
+    # likelihood as a MALA proposal. The chem+T-P block of theta is [lnZ, c_o, lnKzz,
+    # <n_tp T-P params>], so the T-P sub-vector is theta[3:3+n_tp].
+    n_tp = int(fwd.n_tp)
+    p_art_j = jnp.asarray(fwd.p_art_bar, dtype=dtype)
+    tp_eval = fwd.tp_model.eval
+    tp_T_min = jnp.asarray(fwd.tp_model.T_min, dtype)
+    tp_T_max = jnp.asarray(fwd.tp_model.T_max, dtype)
+
+    def tp_valid(theta):
+        """True iff the drawn T-P lies entirely inside [T_min, T_max] on the ART grid."""
+        if n_tp == 0:
+            return jnp.asarray(True)
+        T_art = tp_eval(jnp.asarray(theta)[3:3 + n_tp], p_art_j)
+        return jnp.all(jnp.isfinite(T_art) & (T_art >= tp_T_min) & (T_art <= tp_T_max))
+
+    # ---- observations + linear operators (binning, offsets) ----
+    obs, real_bins = OBS.get_observation_grid(cfg, fwd.wl_um)
+    keep, B = OBS.build_binning_matrix(fwd.wl_um, obs)
+    # apply keep to the observed arrays so obs bins line up with B's rows
+    for k in ("wl", "wl_lo", "wl_hi", "depth", "sigma", "group"):
+        obs[k] = np.asarray(obs[k])[keep]
+    obs["groups"] = list(dict.fromkeys(np.asarray(obs["group"]).tolist()))
+    O = OBS.build_offset_design(obs)
+    groups = list(obs["groups"])
+    n_bin = int(B.shape[0])
+    logger.info(f"Observations: {'REAL product bins' if real_bins else 'synthetic grid'} | "
+                f"{n_bin} bins | groups={groups} | offset cols={O.shape[1]}")
+    if n_bin < 2:
+        raise RuntimeError(f"only {n_bin} usable observed bins in the model band; widen the band")
+
+    B_jax = jnp.asarray(B, dtype=dtype)
+    O_jax = jnp.asarray(O, dtype=dtype)
+
+    # ---- parameter layout ----
+    specs = C.specs_from_config(cfg, groups=groups)
+    names = [s.name for s in specs]
+    kinds = [s.kind for s in specs]
+    labels = [s.label for s in specs]
+    n_dim = len(specs)
+    n_chem_tp = 3 + fwd.n_tp
+    if not all(k in ("chem", "tp") for k in kinds[:n_chem_tp]):
+        raise RuntimeError("parameter layout error: first block must be chem+tp")
+    lnR0_idx = names.index("lnR0") if "lnR0" in names else None
+    cloud_idx = [i for i, k in enumerate(kinds) if k == "cloud"]
+    off_idx = [i for i, k in enumerate(kinds) if k == "offset"]
+    noise_idx = names.index("noise_inflation") if "noise_inflation" in names else None
+    off_lo = off_idx[0] if off_idx else None
+    n_off = len(off_idx)
+    cloud_lo = cloud_idx[0] if cloud_idx else None
+    n_cloud = len(cloud_idx)
+
+    prior_types = [s.prior_type for s in specs]
+    param_truth = np.asarray([s.truth for s in specs], dtype=npdtype)
+
+    # ---- u-space reparameterization (bounded prior <-> unconstrained u) ----
+    theta_from_u, log_prior_u, sample_prior_u = make_uspace(specs, dtype)
+    theta_truth = jnp.asarray(param_truth, dtype=dtype)
+
+    # ---- prior draws restricted to the T-P window (no clip -> redraw) ----------
+    # Draw from the box prior and REDRAW any particle whose Guillot T-P leaves the
+    # modelable window. Cheap (Guillot only, no chemistry). The effective prior is
+    # (box) INTERSECT (T-P in window); MALA stays inside it because an out-of-window
+    # proposal gets -inf likelihood (rejected) at every beta>0.
+    _tp_valid_batch = jax.jit(lambda U: jax.vmap(lambda u: tp_valid(theta_from_u(u)))(U))
+
+    def sample_prior_u_valid(rng_key, n_particles):
+        n_particles = int(n_particles)
+        if n_tp == 0:
+            return sample_prior_u(rng_key, n_particles)
+        key = rng_key
+        kept, have, drawn = [], 0, 0
+        over = max(n_particles, 16)
+        max_draw = max(64 * n_particles, 4096)   # loud cap: fail rather than loop forever
+        while have < n_particles:
+            key, sub = jax.random.split(key)
+            cand = sample_prior_u(sub, over)
+            good = np.asarray(jax.device_get(_tp_valid_batch(cand)))
+            drawn += over
+            if good.any():
+                kept.append(np.asarray(jax.device_get(cand))[good])
+                have += int(good.sum())
+            if have < n_particles and drawn >= max_draw:
+                raise RuntimeError(
+                    f"prior T-P rejection: only {have}/{n_particles} valid draws after "
+                    f"{drawn} candidates (accept frac {have / max(drawn, 1):.1%}). The "
+                    "T-P prior puts most of its mass outside the modelable window "
+                    f"[{float(tp_T_min):.0f}, {float(tp_T_max):.0f}] K -- tighten "
+                    "prior_Tirr / prior_log10gamma in case.py so realistic W39b profiles "
+                    "dominate instead of being redrawn away.")
+        U = np.concatenate(kept, axis=0)[:n_particles]
+        n_cand = drawn
+        if n_cand > 2 * n_particles:
+            logger.info(f"prior T-P rejection: kept {n_particles} valid draws from "
+                        f"{n_cand} candidates (accept frac {n_particles / n_cand:.1%}); "
+                        "a low fraction means the T-P prior reaches unmodelable corners.")
+        return jnp.asarray(U, dtype)
+
+    # ---- forward -> observed (binned + offset) depth ----
+    pipe = Pipeline()
+
+    def _cloud_from(theta):
+        return theta[cloud_lo:cloud_lo + n_cloud] if n_cloud else None
+
+    def observed_depth_model(theta):
+        theta = jnp.asarray(theta, dtype=dtype)
+        chem_theta = theta[:n_chem_tp]
+        lnR0 = theta[lnR0_idx] if lnR0_idx is not None else jnp.asarray(0.0, dtype)
+        native = fwd.native_depth(chem_theta, lnR0, _cloud_from(theta))  # (n_native,)
+        binned = B_jax @ native                                # (n_bin,)
+        if n_off > 0:
+            offs = jax.lax.dynamic_slice_in_dim(theta, off_lo, n_off) * OBS.OFFSET_UNIT
+            binned = binned + O_jax @ offs
+        return binned
+
+    observed_depth_model_jit = jax.jit(observed_depth_model)
+
+    # ---- likelihood in u-space (Gaussian, per-bin sigma, finite-guarded) ----
+    def _sigma_for(theta):
+        sig = pipe.obs_sigma_jax
+        if noise_idx is not None:
+            sig = sig * theta[noise_idx]
+        return sig
+
+    def _gauss_loglik(mu, theta):
+        """The (finite-branch) Gaussian log-likelihood formula -- single source of
+        truth shared by log_likelihood_u and the block-structured gradient."""
+        sig = _sigma_for(theta)
+        r = (pipe.obs_depth_jax - mu) / sig
+        n = mu.size
+        return (-0.5 * jnp.sum(r * r) - jnp.sum(jnp.log(sig))
+                - 0.5 * n * jnp.log(jnp.asarray(2.0 * math.pi, dtype=dtype)))
+
+    _REJECT = jnp.asarray(-1.0e30, dtype=dtype)
+
+    def log_likelihood_u(u):
+        theta = theta_from_u(u)
+
+        def _bad():
+            return _REJECT
+
+        def _good():
+            # only reached for an in-window T-P, so the RT never extrapolates
+            mu = observed_depth_model(theta)
+            return jax.lax.cond(jnp.all(jnp.isfinite(mu)),
+                                lambda: _gauss_loglik(mu, theta), _bad)
+
+        # short-circuit an out-of-window T-P to -inf WITHOUT running the forward
+        return jax.lax.cond(tp_valid(theta), _good, _bad)
+
+    # ---- forward-mode value-and-grad (no reverse tape through the VULCAN loop) ----
+    def _value_and_grad_naive(u):
+        """n_dim forward-mode jvps of the scalar likelihood (the SWAMPE pattern).
+        Every u-direction -- including the chemistry-free lnR0/offset/noise dims --
+        pays a full tangent pass through the VULCAN while_loop."""
+        u = jnp.asarray(u)
+        eye = jnp.eye(n_dim, dtype=u.dtype)
+        y0, dy0 = jax.jvp(log_likelihood_u, (u,), (eye[0],))
+        if n_dim == 1:
+            return y0, jnp.atleast_1d(dy0)
+        dy_rest = jax.vmap(lambda v: jax.jvp(log_likelihood_u, (u,), (v,))[1])(eye[1:])
+        return y0, jnp.concatenate([jnp.atleast_1d(dy0), dy_rest], axis=0)
+
+    def _value_and_grad_block(u):
+        """Block-structured exact gradient: only the n_chem_tp chemistry+T-P directions
+        take tangents through the VULCAN while_loop -- all in ONE vmapped jvp (a single
+        batched device call; the primal + ART-grid aux are read from lane 0, whose primal
+        is identical across lanes). lnR0 + cloud dims are one cheap RT-only jacfwd at the
+        frozen aux profiles; offsets and noise-inflation are analytic. Exact (the
+        parameter blocks enter mu through disjoint sub-graphs); asserted equal to the
+        naive gradient in the smoke test."""
+        u = jnp.asarray(u)
+        theta = theta_from_u(u)
+        # diagonal d(theta)/d(u): theta_from_u is elementwise, so J @ 1 == diag(J)
+        _, dtheta_du = jax.jvp(theta_from_u, (u,), (jnp.ones_like(u),))
+        c = theta[:n_chem_tp]
+        r0 = theta[lnR0_idx] if lnR0_idx is not None else jnp.asarray(0.0, dtype)
+        cloudp = _cloud_from(theta)
+
+        eye_c = jnp.eye(n_chem_tp, dtype=u.dtype)
+
+        def _chain(cc):
+            return fwd.native_depth_aux(cc, r0, cloudp)
+
+        (d_all, aux_all), (J_chem, _) = jax.vmap(
+            lambda v: jax.jvp(_chain, (c,), (v,)))(eye_c)
+        d0 = d_all[0]                                            # primal native depth
+        aux = jax.tree_util.tree_map(lambda x: x[0], aux_all)    # primal ART-grid profiles
+        # J_chem: (n_chem_tp, n_native) tangent stack
+
+        # mu = B @ native + O @ offsets  (identical to observed_depth_model)
+        mu = B_jax @ d0
+        if n_off > 0:
+            offs = theta[off_lo:off_lo + n_off] * OBS.OFFSET_UNIT
+            mu = mu + O_jax @ offs
+
+        sig = _sigma_for(theta)
+        resid = pipe.obs_depth_jax - mu
+        wres = resid / (sig * sig)                                   # dL/dmu
+        val = _gauss_loglik(mu, theta)
+
+        Btw = B_jax.T @ wres                                         # (n_native,)
+        g_theta = jnp.zeros((n_dim,), dtype=u.dtype)
+        g_theta = g_theta.at[:n_chem_tp].set(J_chem @ Btw)
+
+        # RT-only dims (lnR0 + cloud params): one jacfwd through the RT at frozen aux
+        rt_idx = ([lnR0_idx] if lnR0_idx is not None else []) + cloud_idx
+        if rt_idx:
+            has_r = lnR0_idx is not None
+            rv0 = jnp.stack([theta[i] for i in rt_idx])
+
+            def _rt(rv):
+                r = rv[0] if has_r else jnp.asarray(0.0, u.dtype)
+                if n_cloud:
+                    cp = rv[1:] if has_r else rv
+                else:
+                    cp = None
+                return fwd.rt_depth(aux, r, cp)
+
+            J_rt = jax.jacfwd(_rt)(rv0)                          # (n_native, n_rt)
+            for j, i in enumerate(rt_idx):
+                g_theta = g_theta.at[i].set(jnp.dot(J_rt[:, j], Btw))
+        if n_off > 0:
+            g_theta = g_theta.at[off_lo:off_lo + n_off].set(OBS.OFFSET_UNIT * (O_jax.T @ wres))
+        if noise_idx is not None:
+            k = theta[noise_idx]
+            sig0 = pipe.obs_sigma_jax
+            g_theta = g_theta.at[noise_idx].set(
+                jnp.sum(resid * resid / (sig0 * sig0 * k ** 3)) - mu.size / k)
+
+        grad_u = g_theta * dtheta_du
+        # reject an out-of-window T-P (no clip) as well as a blown forward
+        finite = jnp.all(jnp.isfinite(d0)) & tp_valid(theta)
+        val = jnp.where(finite, val, jnp.asarray(-1.0e30, dtype=dtype))
+        return val, jnp.where(finite, grad_u, jnp.zeros_like(grad_u))
+
+    grad_mode = str(cfg.gradient_mode).strip().lower()
+    if grad_mode not in ("block", "naive"):
+        raise ValueError(f"gradient_mode must be 'block' or 'naive', got {grad_mode!r}")
+    _vg_impl = _value_and_grad_block if grad_mode == "block" else _value_and_grad_naive
+
+    use_custom = bool(cfg.smc_use_custom_gradients) and (n_dim <= int(cfg.smc_custom_grad_max_dim))
+    if use_custom:
+        @jax.custom_vjp
+        def loglik_fwd(u):
+            return log_likelihood_u(u)
+
+        def _fwd(u):
+            # Return the gradient RAW. A rejected proposal (non-finite forward) is
+            # already handled inside _vg_impl (val -> -1e30, grad -> 0: principled MH
+            # rejection). A finite forward with a non-finite gradient is an AD
+            # pathology and MUST reach the caller's bad-grad detector so the run
+            # raises loudly -- zeroing it here would silently degrade MALA to a random
+            # walk (project rule: loud errors, no silent fallbacks).
+            return _vg_impl(u)
+
+        def _bwd(grad, g):
+            return (g * grad,)
+
+        loglik_fwd.defvjp(_fwd, _bwd)
+    else:
+        loglik_fwd = log_likelihood_u
+
+    # =========================================================================
+    # Staged BATCHED likelihood / gradient (the SMC hot path; see module docstring).
+    # Exact -- the same chain rule as _value_and_grad_block, regrouped:
+    #   dL/dtheta_chem[k] = < d aux / d theta[k]  (fwd jvp through the chemistry),
+    #                         d L / d aux          (rev vjp through the RT) >.
+    # =========================================================================
+    chem_mode = str(cfg.smc_chem_mode).strip().lower()
+    if chem_mode not in ("warm", "cold"):
+        raise ValueError(f"smc_chem_mode must be 'warm' or 'cold', got {chem_mode!r}")
+    rt_chunk = int(cfg.smc_rt_chunk or 0)
+    rt_vjp_chunk = int(cfg.smc_rt_vjp_chunk or 0)
+    chem_chunk = int(cfg.smc_chem_chunk or 0)
+    y_baseline = jnp.asarray(fwd.y_baseline, dtype=dtype)          # (nz, ni)
+    eye_c = jnp.eye(n_chem_tp, dtype=dtype)
+    have_cloud = bool(n_cloud)
+
+    def _rt_wrap(aux, r0, cp):
+        # cp is a dummy (0,) array when clouds are off, so the vjp signature is fixed
+        return fwd.rt_depth(aux, r0, cp if have_cloud else None)
+
+    def _mu_from_depth(depth, theta):
+        mu = B_jax @ depth
+        if n_off > 0:
+            mu = mu + O_jax @ (theta[off_lo:off_lo + n_off] * OBS.OFFSET_UNIT)
+        return mu
+
+    def _rt_val(args):
+        """Per-particle RT stage, primal only: aux profiles -> loglik value."""
+        aux, theta = args
+        r0 = theta[lnR0_idx] if lnR0_idx is not None else jnp.asarray(0.0, dtype)
+        cp = theta[cloud_lo:cloud_lo + n_cloud] if have_cloud else jnp.zeros((0,), dtype)
+        depth = _rt_wrap(aux, r0, cp)
+        mu = _mu_from_depth(depth, theta)
+        val = _gauss_loglik(mu, theta)
+        finite = jnp.all(jnp.isfinite(depth))
+        return jnp.where(finite, val, jnp.asarray(-1.0e30, dtype))
+
+    def _rt_val_grad(args):
+        """Per-particle RT stage WITH gradient: primal depth + ONE reverse-mode vjp.
+        ``daux`` is the (n_chem_tp,)-stacked aux tangent pytree from the chemistry
+        jvp lanes; contracting it against the RT cotangent gives the chem+T-P block,
+        and the same vjp call yields the lnR0/cloud entries for free."""
+        aux, daux, theta = args
+        r0 = theta[lnR0_idx] if lnR0_idx is not None else jnp.asarray(0.0, dtype)
+        cp = theta[cloud_lo:cloud_lo + n_cloud] if have_cloud else jnp.zeros((0,), dtype)
+        depth, vjp_fn = jax.vjp(_rt_wrap, aux, r0, cp)
+        mu = _mu_from_depth(depth, theta)
+        sig = _sigma_for(theta)
+        resid = pipe.obs_depth_jax - mu
+        wres = resid / (sig * sig)                                   # dL/dmu
+        val = _gauss_loglik(mu, theta)
+        Btw = B_jax.T @ wres                                         # (n_native,)
+        aux_bar, r_bar, cloud_bar = vjp_fn(Btw)
+        g = jnp.zeros((n_dim,), dtype)
+        g = g.at[:n_chem_tp].set(jax.vmap(lambda d: _tree_dot(d, aux_bar))(daux))
+        if lnR0_idx is not None:
+            g = g.at[lnR0_idx].set(r_bar)
+        if have_cloud:
+            g = g.at[cloud_lo:cloud_lo + n_cloud].set(cloud_bar)
+        if n_off > 0:
+            g = g.at[off_lo:off_lo + n_off].set(OBS.OFFSET_UNIT * (O_jax.T @ wres))
+        if noise_idx is not None:
+            k = theta[noise_idx]
+            sig0 = pipe.obs_sigma_jax
+            g = g.at[noise_idx].set(
+                jnp.sum(resid * resid / (sig0 * sig0 * k ** 3)) - mu.size / k)
+        finite = jnp.all(jnp.isfinite(depth))
+        # A non-finite DEPTH is a rejected proposal (-1e30 sentinel -> -inf MH accept;
+        # its gradient is then irrelevant and zeroed only to keep arithmetic clean).
+        # A finite depth with a NON-FINITE GRADIENT is an AD pathology: flag it so the
+        # host driver raises loudly (project rule: no silent gradient-free fallback).
+        bad_grad = finite & ~jnp.all(jnp.isfinite(g))
+        val = jnp.where(finite, val, jnp.asarray(-1.0e30, dtype))
+        g = jnp.where(finite & jnp.isfinite(g), g, jnp.zeros_like(g))
+        return val, g, bad_grad
+
+    def _make_batch_eval(mode: str, want_grad: bool, diag: bool = False):
+        """Build eval(U, Y, refs) -> (L, G, Y_new, refs_new, n_bad_grad) when
+        want_grad, else (L, Y_new, refs_new) [+ worst_accept when diag]; all
+        (N,)-batched. ``n_bad_grad`` counts finite-likelihood/non-finite-gradient AD
+        pathologies -- the host driver raises on it (loud-error rule; no silent
+        random-walk degradation).
+
+        mode="warm": each particle's chemistry re-converges by continuation from its
+        carried column Y with incremental (lnZ - refs[0], c_o - refs[1]) scaling.
+        mode="cold": the published solve-from-baseline (two-stage) map; Y/refs are
+        still updated from the converged result so cold evals can seed warm ones.
+
+        ``diag`` (only meaningful for mode="cold", want_grad=False -- the SMC init's
+        likelihood-only phase) additionally threads each particle's worst-stage
+        accept_count through, so the caller can detect a count_max-exhausted
+        (not-actually-converged) cold solve instead of silently carrying it into L."""
+        warm = (mode == "warm")
+        assert not (diag and (warm or want_grad)), "diag is cold+no-grad only"
+        # convergence gate for the warm mutation grad: the warm solver itself is capped
+        # at warm_count_max (a proposal that hasn't converged there is doomed -- reject
+        # it instead of dragging the lockstep batch to the cold count_max)
+        wcmax = int(fwd.chem.warm_count_max)
+
+        def _solve(c, yw, rf):
+            return (fwd.chem_solve_warm(c, yw, rf[0], rf[1]) if warm
+                    else fwd.chem_solve_cold(c))
+
+        if want_grad:
+            # A warm MALA proposal can continue into a non-convergent corner and return
+            # a finite-but-unconverged column whose jvp/RT-vjp tangents are garbage. The
+            # cold init rejects such draws BEFORE its gradient pass (phase-1 diag); here
+            # the warm accept_count rides the jvp'd chain itself -- it is part of the
+            # runner's primal carry, so reading it is FREE (an earlier version ran a
+            # second primal-only while_loop just for it, doubling the chemistry wall
+            # time per sweep). It is integer-valued (no tangent); stop_gradient + cast
+            # keeps the jvp output pytree all-float. eval_batch rejects an exhausted
+            # proposal (-inf L, MH rejection) and drops it from the gradient-health
+            # tally. The cold grad path (init phase 2) runs on already-converged
+            # survivors; its accept-count slot is a constant 0 (never gates).
+            if warm:
+                def _solve_ac(c, yw, rf):
+                    return fwd.chem_solve_warm_diag(c, yw, rf[0], rf[1])
+            else:
+                def _solve_ac(c, yw, rf):
+                    return fwd.chem_solve_cold(c), jnp.zeros((), jnp.int32)
+
+            def _chem_one(cc, yw, rf):
+                def _chain(c):
+                    y, ac = _solve_ac(c, yw, rf)
+                    acf = jax.lax.stop_gradient(jnp.asarray(ac, dtype))
+                    return fwd.aux_from_y(y, c), y, acf
+                (aux_l, y_l, ac_l), (daux_l, _dy, _dac) = jax.vmap(
+                    lambda v: jax.jvp(_chain, (cc,), (v,)))(eye_c)
+                aux = jax.tree_util.tree_map(lambda x: x[0], aux_l)  # primal (lane 0)
+                return aux, daux_l, y_l[0], ac_l[0].astype(jnp.int32)
+        elif diag:
+            def _chem_one(cc, yw, rf):
+                y, worst_accept = fwd.chem_solve_cold_diag(cc)
+                return fwd.aux_from_y(y, cc), y, worst_accept
+        else:
+            def _chem_one(cc, yw, rf):
+                y = _solve(cc, yw, rf)
+                return fwd.aux_from_y(y, cc), y
+
+        def eval_batch(U, Y, refs):
+            U = jnp.asarray(U, dtype)
+            Theta = jax.vmap(theta_from_u)(U)                        # (N, n_dim)
+            _, dTh = jax.vmap(
+                lambda u: jax.jvp(theta_from_u, (u,), (jnp.ones_like(u),)))(U)
+            C_ = Theta[:, :n_chem_tp]
+            # per-particle T-P window mask (no clip): an out-of-window proposal is
+            # rejected (-inf L, state pinned to baseline) and is NOT flagged as an AD
+            # pathology (its gradient is irrelevant once MH rejects it).
+            valid = (jax.vmap(tp_valid)(Theta) if n_tp > 0
+                     else jnp.ones((Theta.shape[0],), bool))
+            usable = valid   # narrowed to (valid & converged) on the warm gradient path
+            if want_grad:
+                # Chemistry jvp lanes, optionally lax.map-chunked over particles.
+                # Probe 2026-07-07: staged chem tangent lanes cost ~20 MB per
+                # lane-pair (0.78 GiB at 36 lanes), so full width (chem_chunk=0)
+                # is the default -- the old ~1.3 GB/lane figure was the all-in-one
+                # architecture's PreMODIT tangents (the 390 GiB OOM), misattributed
+                # to photo temporaries. The RT VJP below is the real memory wall
+                # (18.4 GiB first lane, ~9.4 GiB per additional at nu_pts=5000).
+                AUX, DAUX, Ynew, ACC = _map_chunked(lambda a: _chem_one(*a),
+                                                    (C_, Y, refs), chem_chunk)
+                vals, g_th, bads = _map_chunked(_rt_val_grad, (AUX, DAUX, Theta),
+                                                rt_vjp_chunk)
+                G = g_th * dTh                                       # chain to u-space
+                # A warm_count_max-exhausted WARM proposal is an MH rejection, not an AD
+                # pathology: its (garbage) gradient must NOT trip n_bad_grad. ACC is 0 on
+                # the cold grad path, so `converged` is all-True there and nothing changes.
+                usable = valid & (ACC < wcmax)
+                n_bad = jnp.sum((bads & usable).astype(jnp.int32))
+            elif diag:
+                AUX, Ynew, worst_accept = jax.vmap(_chem_one)(C_, Y, refs)
+                vals = _map_chunked(_rt_val, (AUX, Theta), rt_chunk)
+                G = None
+            else:
+                AUX, Ynew = jax.vmap(_chem_one)(C_, Y, refs)
+                vals = _map_chunked(_rt_val, (AUX, Theta), rt_chunk)
+                G = None
+            L = jnp.where(jnp.isfinite(vals) & usable, vals, jnp.asarray(-1.0e30, dtype))
+            # a blown (-1e30, rejected/culled) solve -- non-finite forward, an
+            # out-of-window T-P, OR a non-converged warm proposal -- must not poison the
+            # carried state arithmetic: pin it to the baseline column. This is part of the
+            # MH rejection mechanics, not an error path -- true failures surface through
+            # the -1e30 likelihood (init raises) or n_bad_grad (host raises).
+            ok = jnp.all(jnp.isfinite(Ynew), axis=(1, 2)) & usable
+            Ynew = jnp.where(ok[:, None, None], Ynew, y_baseline[None])
+            refs_new = jnp.where(ok[:, None], C_[:, :2], jnp.zeros_like(refs))
+            if want_grad:
+                return L, G, Ynew, refs_new, n_bad
+            if diag:
+                return L, Ynew, refs_new, worst_accept
+            return L, Ynew, refs_new
+
+        return eval_batch
+
+    # ---- assemble ----
+    pipe.__dict__.update(dict(
+        cfg=cfg, dtype=dtype, npdtype=npdtype,
+        fwd=fwd, obs=obs, real_bins=real_bins, groups=groups,
+        B=B, O=O, n_bin=n_bin,
+        specs=specs, names=names, kinds=kinds, labels=labels, n_dim=n_dim,
+        n_chem_tp=n_chem_tp, lnR0_idx=lnR0_idx, off_idx=off_idx, noise_idx=noise_idx,
+        cloud_idx=cloud_idx, n_cloud=n_cloud,
+        param_prior_lo=np.asarray([s.lo for s in specs], npdtype),
+        param_prior_hi=np.asarray([s.hi for s in specs], npdtype),
+        param_truth=param_truth, prior_types=prior_types,
+        # sample_prior_u is the T-P-window-restricted (redraw) sampler; the raw box
+        # sampler + the validity predicate are exposed for diagnostics/calibration.
+        theta_from_u=theta_from_u, log_prior_u=log_prior_u, sample_prior_u=sample_prior_u_valid,
+        sample_prior_u_box=sample_prior_u, tp_valid=tp_valid, n_tp=n_tp,
+        theta_truth=theta_truth,
+        observed_depth_model=observed_depth_model, observed_depth_model_jit=observed_depth_model_jit,
+        log_likelihood_u=log_likelihood_u, loglik_fwd=loglik_fwd, use_custom_grads=use_custom,
+        gradient_mode=grad_mode,
+        value_and_grad_naive=_value_and_grad_naive, value_and_grad_block=_value_and_grad_block,
+        # staged batched evaluators (the SMC hot path)
+        has_chem_state=True, chem_mode=chem_mode, y_baseline=y_baseline,
+        batch_eval_cold_vg=_make_batch_eval("cold", True),
+        batch_eval_cold_l=_make_batch_eval("cold", False),
+        batch_eval_cold_l_diag=_make_batch_eval("cold", False, diag=True),
+        batch_eval_move_vg=_make_batch_eval(chem_mode, True),
+        batch_eval_move_l=_make_batch_eval(chem_mode, False),
+        # observations injected by set_observations
+        obs_depth_jax=None, obs_sigma_jax=None, obs_depth=None, obs_sigma=None, flux_true=None,
+    ))
+
+    def set_observations(depth, sigma):
+        depth = np.asarray(depth, npdtype).reshape(-1)
+        sigma = np.asarray(sigma, npdtype).reshape(-1)
+        if depth.shape[0] != n_bin or sigma.shape[0] != n_bin:
+            raise ValueError(f"obs depth/sigma length must be n_bin={n_bin}")
+        pipe.obs_depth = depth
+        pipe.obs_sigma = sigma
+        pipe.obs_depth_jax = jnp.asarray(depth, dtype=dtype)
+        pipe.obs_sigma_jax = jnp.asarray(sigma, dtype=dtype)
+
+    pipe.set_observations = set_observations
+    return pipe
+
+
+# =============================================================================
+# Observations
+# =============================================================================
+def load_real_into_pipe(pipe: Pipeline) -> Dict[str, np.ndarray]:
+    """Inject the real observed depths + sigmas already attached to pipe.obs."""
+    obs = pipe.obs
+    depth = np.asarray(obs["depth"], pipe.npdtype)
+    sigma = np.asarray(obs["sigma"], pipe.npdtype)
+    pipe.set_observations(depth, sigma)
+    pipe.flux_true = np.full_like(depth, np.nan)
+    return dict(depth=depth, sigma=sigma)
+
+
+def generate_observations(pipe: Pipeline, seed: int) -> Dict[str, np.ndarray]:
+    """Synthetic injection: model at truth, add Gaussian noise at the (real, if available)
+    per-bin sigma. Injects into pipe and returns the arrays."""
+    cfg = pipe.cfg
+    sigma = np.asarray(pipe.obs["sigma"], pipe.npdtype)
+    mu_true = np.asarray(pipe.observed_depth_model_jit(pipe.theta_truth), pipe.npdtype)
+    if not np.all(np.isfinite(mu_true)):
+        raise RuntimeError("truth forward is non-finite; check truth_* and priors")
+    rng = np.random.default_rng(seed)
+    depth = mu_true + rng.standard_normal(mu_true.shape) * sigma
+    pipe.set_observations(depth, sigma)
+    pipe.flux_true = mu_true
+    return dict(depth=depth, sigma=sigma, flux_true=mu_true)
+
+
+# =============================================================================
+# SMC core (self-contained, pure JAX)
+# =============================================================================
+def _ess_from_incremental(L: np.ndarray, dbeta: float) -> float:
+    a = dbeta * (L - L.max())
+    w = np.exp(a)
+    s = w.sum()
+    if not np.isfinite(s) or s <= 0:
+        return 0.0
+    w = w / s
+    return float(1.0 / np.sum(w * w))
+
+
+def _next_dbeta(L: np.ndarray, beta: float, target_ess: float, tol: float = 1e-4) -> float:
+    """Bisection for the temperature increment so ESS(exp(dbeta*L)) = target_ess.
+    Returns dbeta in (0, 1-beta]; jumps to 1-beta when even the full step keeps ESS high."""
+    dmax = 1.0 - beta
+    if dmax <= 0:
+        return 0.0
+    if _ess_from_incremental(L, dmax) >= target_ess:
+        return dmax
+    lo, hi = 0.0, dmax
+    for _ in range(60):
+        mid = 0.5 * (lo + hi)
+        if _ess_from_incremental(L, mid) >= target_ess:
+            lo = mid
+        else:
+            hi = mid
+        if hi - lo < tol * dmax:
+            break
+    return 0.5 * (lo + hi)
+
+
+def _systematic_resample_idx(key, weights, N):
+    u0 = jax.random.uniform(key, dtype=weights.dtype)
+    positions = (u0 + jnp.arange(N, dtype=weights.dtype)) / N
+    return jnp.clip(jnp.searchsorted(jnp.cumsum(weights), positions), 0, N - 1)
+
+
+def _abs_scale_diag(particles: np.ndarray, cap: float) -> np.ndarray:
+    """ABSOLUTE per-dimension std of the (resampled, uniformly-weighted) cloud.
+
+    Used as the diagonal proposal scale: the MALA proposal then narrows in lockstep
+    with the tempered posterior, so the scalar step size only fine-tunes toward the
+    target acceptance instead of chasing orders of magnitude of width (the SWAMPE
+    unit-geometric-mean normalization left the width entirely to the Robbins-Monro
+    step, which lags the ladder and collapses acceptance after big beta jumps --
+    reproduced by tests/test_smc_gaussian.py before this change)."""
+    p = np.asarray(particles, np.float64)
+    scale = p.std(axis=0)
+    if not np.all(np.isfinite(scale)):
+        return np.ones(p.shape[1])
+    return np.clip(scale, 1e-3, float(cap))
+
+
+def _get_batch_evals(pipe: Pipeline):
+    """(cold_vg, cold_l, move_vg, move_l) batched evaluators, each with the signature
+    eval(U, Y, refs) -> (L[, G], Y_new, refs_new). Real pipelines carry the staged
+    chemistry+RT evaluators; stub pipes (unit tests, no chemistry) get a stateless
+    adapter so the SMC/MALA core is exercised through the exact same code path."""
+    if getattr(pipe, "has_chem_state", False):
+        return (pipe.batch_eval_cold_vg, pipe.batch_eval_cold_l,
+                pipe.batch_eval_move_vg, pipe.batch_eval_move_l)
+    if not hasattr(pipe, "_stub_evals"):
+        vg1 = jax.value_and_grad(pipe.loglik_fwd)
+
+        def eval_vg(U, Y, refs):
+            L, G = jax.vmap(vg1)(U)
+            bad = jnp.isfinite(L) & ~jnp.all(jnp.isfinite(G), axis=1)
+            return L, G, Y, refs, jnp.sum(bad.astype(jnp.int32))
+
+        def eval_l(U, Y, refs):
+            return jax.vmap(pipe.log_likelihood_u)(U), Y, refs
+
+        pipe._stub_evals = (eval_vg, eval_l)
+    evg, el = pipe._stub_evals
+    return evg, el, evg, el
+
+
+def _blank_state(pipe: Pipeline, N: int):
+    """(Y0, refs0) placeholders for a fresh particle cloud: the baked baseline column
+    for real pipelines (matching refs (lnZ, c_o) = (0, 0)), inert zeros for stubs."""
+    dtype = pipe.dtype
+    if getattr(pipe, "has_chem_state", False):
+        Y0 = jnp.broadcast_to(pipe.y_baseline[None],
+                              (N,) + tuple(pipe.y_baseline.shape)).astype(dtype)
+    else:
+        Y0 = jnp.zeros((N, 1, 1), dtype)
+    return Y0, jnp.zeros((N, 2), dtype)
+
+
+def _init_draw_count(pipe: Pipeline, n_target: int) -> int:
+    """Oversampled cold-init draw count so reject-and-cull still leaves ``n_target``
+    healthy particles. Stub pipes (no chemistry) never fail to converge, so they draw
+    exactly n_target; real pipelines draw ceil(n_target * cfg.init_oversample)."""
+    n_target = int(n_target)
+    if not getattr(pipe, "has_chem_state", False):
+        return n_target
+    over = float(getattr(pipe.cfg, "init_oversample", 1.6))
+    return max(n_target, int(math.ceil(n_target * over)))
+
+
+def _init_state(pipe: Pipeline, U, target_n: Optional[int] = None):
+    """Initialize the SMC particle state, returning (U_kept, L, G, Y, refs) for exactly
+    ``target_n`` healthy particles (default: all of U).
+
+    ``U`` is an OVERSAMPLED prior cloud (len(U) = ceil(target_n * init_oversample) for
+    real pipelines; see _init_draw_count). The two phases:
+
+    Phase 1 -- cold LIKELIHOOD-ONLY pass over ALL len(U) draws at full width (one primal
+    lane per particle, no tangents). Draws whose chemistry doesn't converge within
+    count_max -- or whose forward is non-finite -- are REJECTED, and the first
+    ``target_n`` survivors are kept. This is the best-practice handling of forward-model
+    failures: petitRADTRANS / nested-sampling codes discard an invalid forward with -inf
+    likelihood, and Herbst-Schorfheide SMC oversamples so the culled cloud still carries
+    the target number of particles (ESS preserved). Non-convergence at extreme prior
+    corners (hot + extreme-Kzz) is EXPECTED for a full-kinetics forward, not a bug --
+    _init_state raises only if fewer than target_n survive (a systemic prior/config
+    problem). Wall time is one lockstep max over the draws, count_max-bounded; widening
+    the draw to oversample is ~free because the slowest draw dominates regardless.
+
+    Phase 2 -- gradient pass through the MOVE evaluator on the target_n SURVIVORS ONLY
+    (the expensive jvp/vjp lanes are never paid on a rejected draw): each survivor
+    re-converges from its own phase-1 column (~count_min steps) and the jvp lanes ride
+    that short warm map -- the SAME map every subsequent MALA proposal uses, so the
+    carried (L, G) are consistent with the rest of the run by construction.
+
+    Survivors are fully converged, so phase 2 must be SOUND -- there is no MH rejection
+    to absorb failures here. A non-finite likelihood or flagged gradient pathology on a
+    survivor raises (loud-error rule): that is a real AD/RT problem, NOT a hard prior
+    corner (those were already rejected in phase 1)."""
+    M = int(U.shape[0])
+    if target_n is None:
+        target_n = M
+    target_n = int(target_n)
+    if M < target_n:
+        raise RuntimeError(f"_init_state got {M} draw(s) but target_n={target_n}: the "
+                           "oversampled draw must be at least the target particle count")
+    Y0, refs0 = _blank_state(pipe, M)
+    _, cold_l, move_vg, _ = _get_batch_evals(pipe)
+    # Real (chem-backed) pipelines get the diag-threading cold evaluator so phase 1 can
+    # detect a count_max-exhausted (not-actually-converged) particle and REJECT it; stub
+    # pipes (unit tests, no chemistry) keep plain cold_l -- there is no while_loop to
+    # exhaust, so nothing is ever rejected there.
+    has_diag = bool(getattr(pipe, "has_chem_state", False))
+    cold_l_init = pipe.batch_eval_cold_l_diag if has_diag else cold_l
+
+    def _dead_check(L_arr, where):
+        L_np = np.asarray(jax.device_get(L_arr), np.float64)
+        dead = ~np.isfinite(L_np) | (L_np <= -1.0e29)
+        if np.any(dead):
+            raise RuntimeError(
+                f"{int(dead.sum())}/{len(L_np)} SURVIVING particle(s) produced a "
+                f"non-finite forward model at {where} (indices "
+                f"{np.flatnonzero(dead).tolist()}). These already converged in phase 1, "
+                "so this is an RT/AD problem, not a hard prior corner -- refusing to "
+                "start the SMC on a crippled cloud.")
+
+    if not hasattr(pipe, "_init_l_jit"):
+        pipe._init_l_jit = jax.jit(cold_l_init)
+        pipe._init_mv_jit = jax.jit(move_vg)
+
+    # ---- phase 1: cold likelihood over the full (oversampled) draw ----
+    t0 = time.perf_counter()
+    logger.info(f"init 1/2: batched cold two-stage chemistry over {M} draw(s) "
+                f"(likelihood only; reject non-converged, keep {target_n}; wall time = "
+                "the slowest draw, count_max-bounded)")
+    if has_diag:
+        L0, Y, refs, worst_accept = pipe._init_l_jit(U, Y0, refs0)
+    else:
+        L0, Y, refs = pipe._init_l_jit(U, Y0, refs0)
+    jax.block_until_ready(L0)
+
+    # per-particle rejection: non-finite forward OR count_max-exhausted (real pipes only)
+    L0_np = np.asarray(jax.device_get(L0), np.float64)
+    nonfinite = ~np.isfinite(L0_np) | (L0_np <= -1.0e29)
+    if has_diag:
+        count_max = int(pipe.fwd.chem.count_max)
+        wa = np.asarray(jax.device_get(worst_accept), np.int64)
+        exhausted = wa >= count_max
+    else:
+        exhausted = np.zeros(M, bool)
+    dead = nonfinite | exhausted
+    alive = np.flatnonzero(~dead)
+    n_alive, n_dead = int(alive.size), int(dead.sum())
+
+    if n_dead:
+        frac = n_dead / M
+        n_ex, n_nf = int(exhausted.sum()), int((nonfinite & ~exhausted).sum())
+        idx_head = np.flatnonzero(dead)[:12].tolist()
+        msg = (f"cold init: rejected {n_dead}/{M} draw(s) ({frac:.0%}: {n_ex} hit "
+               f"count_max, {n_nf} non-finite forward; first indices {idx_head}); "
+               f"keeping {target_n} of {n_alive} survivors")
+        if frac > float(pipe.cfg.init_max_nonconverged_frac):
+            logger.warning(
+                msg + f" -- reject fraction exceeds init_max_nonconverged_frac "
+                f"({float(pipe.cfg.init_max_nonconverged_frac):.0%}); the prior reaches "
+                "many non-convergent corners (hot / extreme-Kzz). Expected for a "
+                "full-kinetics forward and absorbed by reject+oversample, but if it "
+                "keeps climbing, tighten the prior or raise count_max.")
+        else:
+            logger.info(msg)
+
+    if n_alive < target_n:
+        raise RuntimeError(
+            f"only {n_alive}/{M} cold draws converged; need {target_n}. The "
+            "reject-and-cull ran out of survivors: raise init_oversample (currently "
+            f"{float(getattr(pipe.cfg, 'init_oversample', 1.6)):g}), tighten the prior, "
+            "or raise count_max. This is a systemic prior/config problem, not a few hard "
+            "corners.")
+
+    sel = jnp.asarray(alive[:target_n])
+    U_keep = jnp.asarray(U)[sel]
+    Y, refs = Y[sel], refs[sel]
+    logger.info(f"init 1/2 done in {time.perf_counter() - t0:.1f}s "
+                f"({n_alive} converged, kept {target_n})")
+
+    # ---- phase 2: gradient on the survivors only ----
+    t0 = time.perf_counter()
+    logger.info("init 2/2: move-map gradient at the kept cloud (jvp lanes on short "
+                "re-converges from each survivor's own converged column)")
+    L, G, Y, refs, n_bad = pipe._init_mv_jit(U_keep, Y, refs)
+    jax.block_until_ready(L)
+    n_bad = int(jax.device_get(n_bad))
+    if n_bad > 0:
+        raise RuntimeError(
+            f"{n_bad} SURVIVING particle(s) produced a finite likelihood but a "
+            "NON-FINITE gradient at initialization -- AD pathology in the chemistry "
+            "tangents or RT vjp (these already converged in phase 1, so it is not a "
+            "hard corner); refusing to continue (no silent gradient-free fallback).")
+    _dead_check(L, "the gradient pass of initialization")
+    if not np.all(np.isfinite(np.asarray(jax.device_get(G)))):
+        raise RuntimeError("non-finite gradient entries at initialization")
+    logger.info(f"init 2/2 done in {time.perf_counter() - t0:.1f}s")
+    return U_keep, L, G, Y, refs
+
+
+def _make_mutation(pipe: Pipeline, n_mcmc: int):
+    """Build the jitted state-carrying mutation:
+
+        mutate(key, U, Y, refs, L, G, beta, step, scale)
+            -> (U, Y, refs, L, G, mean_acceptance, n_bad_grad)
+
+    runs `n_mcmc` preconditioned-MALA sweeps over the particle cloud. Every
+    proposal's chemistry warm-starts from the particle's carried converged column Y
+    (continuation refs = the (lnZ, c_o) that column was converged at), so a sweep
+    costs ~count_min chemistry steps instead of a full cold two-stage solve -- and
+    the whole cloud's chemistry runs as ONE wide batched while_loop, with only the
+    memory-heavy RT lax.map-chunked. The warm solve is warm_count_max-capped: a
+    proposal in a non-convergent corner is cut off and rejected there instead of
+    dragging the whole lockstep batch to the cold count_max (the early-ladder
+    wall-clock killer diagnosed on job 64745).
+
+    Each sweep emits a heartbeat log line (index, mean acceptance, rejected-proposal
+    count, n_bad_grad) via jax.debug.callback, so a slow stage shows per-sweep
+    progress instead of hours of silence.
+
+    L and G are the raw log-likelihood and its u-space gradient; the tempered
+    log-density and its gradient are assembled per sweep from the analytic prior
+    (d/du log_prior_u = 1 - 2*sigmoid(u)), so carried state stays beta-independent
+    and survives tempering-ladder moves and resampling untouched.
+
+    n_bad_grad accumulates finite-likelihood/non-finite-gradient AD pathologies
+    across all sweeps; the caller MUST raise on it (loud-error rule -- a MALA that
+    silently loses its gradient is a different sampler)."""
+    dtype = pipe.dtype
+    log_prior_u = pipe.log_prior_u
+    _, _, move_vg, _ = _get_batch_evals(pipe)
+
+    def _heartbeat(s_idx, acc_mean, n_rej, n_bad, n_prop):
+        logger.info(f"    sweep {int(s_idx) + 1}/{n_mcmc}: accept={float(acc_mean):.2f} "
+                    f"rejected={int(n_rej)}/{int(n_prop)} n_bad_grad={int(n_bad)}")
+
+    def mutate(key, U, Y, refs, L, G, beta, step, scale):
+        def dlogprior(U_):
+            return 1.0 - 2.0 * jax.nn.sigmoid(U_)
+
+        def sweep(k, s_idx, U, Y, refs, L, G):
+            kp, ka = jax.random.split(k)
+            noise = jax.random.normal(kp, U.shape, dtype=U.dtype)
+            GT = dlogprior(U) + beta * G
+            U_new = U + step * (scale * scale) * GT + jnp.sqrt(2.0 * step) * scale * noise
+            L_new, G_new, Y_new, refs_new, n_bad = move_vg(U_new, Y, refs)
+            GT_new = dlogprior(U_new) + beta * G_new
+            # asymmetric MH correction for the preconditioned Langevin proposal
+            df = (U_new - U - step * (scale * scale) * GT) / scale
+            dr = (U - U_new - step * (scale * scale) * GT_new) / scale
+            log_q_fwd = -0.25 / step * jnp.sum(df * df, axis=1)
+            log_q_rev = -0.25 / step * jnp.sum(dr * dr, axis=1)
+            LP = jax.vmap(log_prior_u)(U) + beta * L
+            LP_new = jax.vmap(log_prior_u)(U_new) + beta * L_new
+            log_acc = LP_new - LP + log_q_rev - log_q_fwd
+            log_acc = jnp.where(jnp.isfinite(log_acc), log_acc, -jnp.inf)
+            accept = jnp.log(jax.random.uniform(ka, (U.shape[0],), dtype=U.dtype)) < log_acc
+            U = jnp.where(accept[:, None], U_new, U)
+            Y = jnp.where(accept[:, None, None], Y_new, Y)
+            refs = jnp.where(accept[:, None], refs_new, refs)
+            L = jnp.where(accept, L_new, L)
+            G = jnp.where(accept[:, None], G_new, G)
+            acc = jnp.minimum(jnp.exp(jnp.minimum(log_acc, 0.0)), 1.0)
+            # per-sweep progress line (host-side, async): a count_max-gated slow sweep
+            # is visible as it happens instead of after hours of silence
+            n_rej = jnp.sum((L_new <= -1.0e29).astype(jnp.int32))
+            jax.debug.callback(_heartbeat, s_idx, jnp.mean(acc), n_rej, n_bad,
+                               jnp.asarray(U.shape[0], jnp.int32))
+            return U, Y, refs, L, G, acc, n_bad
+
+        def body(carry, xs):
+            k, s_idx = xs
+            U, Y, refs, L, G = carry
+            U, Y, refs, L, G, acc, n_bad = sweep(k, s_idx, U, Y, refs, L, G)
+            return (U, Y, refs, L, G), (jnp.mean(acc), n_bad)
+
+        keys = jax.random.split(key, n_mcmc)
+        (U, Y, refs, L, G), (accs, n_bads) = jax.lax.scan(
+            body, (U, Y, refs, L, G), (keys, jnp.arange(n_mcmc)))
+        return U, Y, refs, L, G, jnp.mean(accs), jnp.sum(n_bads)
+
+    return jax.jit(mutate)
+
+
+def _check_mutation_health(n_bad, where: str) -> None:
+    """Raise loudly on flagged gradient pathologies from a mutation call."""
+    n_bad = int(jax.device_get(n_bad))
+    if n_bad > 0:
+        raise RuntimeError(
+            f"{n_bad} finite-likelihood/non-finite-gradient event(s) during {where} "
+            "-- AD pathology in the chemistry tangents or RT vjp. Refusing to "
+            "continue: zeroing these would silently degrade MALA to a random walk "
+            "(project rule: loud errors, no silent fallbacks).")
+
+
+def tune_step_size(pipe: Pipeline, key) -> float:
+    """One-shot Robbins-Monro pilot at a low beta (unpreconditioned)."""
+    cfg = pipe.cfg
+    if not bool(cfg.mcmc_auto_tune):
+        return float(cfg.mala_step_size)
+    dtype = pipe.dtype
+    n_p = int(cfg.mcmc_tune_particles)
+    beta = jnp.asarray(float(cfg.mcmc_tune_beta), dtype=dtype)
+    scale = jnp.ones((pipe.n_dim,), dtype=dtype)
+    key, sub = jax.random.split(key)
+    U = pipe.sample_prior_u(sub, _init_draw_count(pipe, n_p))
+    U, L, G, Y, refs = _init_state(pipe, U, target_n=n_p)
+    mutate = _make_mutation(pipe, int(cfg.mcmc_tune_steps))
+    log_step = math.log(min(max(float(cfg.mala_step_size), cfg.mcmc_step_size_min), cfg.mcmc_step_size_max))
+    target = float(cfg.mcmc_target_accept_mala)
+    for it in range(int(cfg.mcmc_tune_iters)):
+        key, sub = jax.random.split(key)
+        U, Y, refs, L, G, acc, n_bad = mutate(sub, U, Y, refs, L, G, beta,
+                                              jnp.asarray(math.exp(log_step), dtype), scale)
+        _check_mutation_health(n_bad, f"step-size tuning iteration {it}")
+        acc_f = float(jax.device_get(acc))
+        log_step += float(cfg.mcmc_tune_gain) * (acc_f - target)
+        log_step = math.log(min(max(math.exp(log_step), cfg.mcmc_step_size_min), cfg.mcmc_step_size_max))
+    tuned = float(math.exp(log_step))
+    logger.info(f"Auto-tuned MALA step (u-space): {tuned:.4g} (target_accept={target:.2f})")
+    return tuned
+
+
+def run_smc_loop(pipe: Pipeline, key, progress: bool = True,
+                 checkpoint_path: Optional[Path] = None,
+                 walltime_seconds: float = 0.0,
+                 resume_from: Optional[Path] = None) -> Dict[str, Any]:
+    """Adaptive-tempered SMC to beta=1. Checkpoints after every stage; stops cleanly if
+    the wall-clock budget is exceeded (partial output is always usable). Pass
+    ``resume_from=<checkpoint.npz>`` to continue a killed run from its tempered cloud
+    (the ladder resumes at the checkpointed beta; already-completed stages are kept)."""
+    cfg = pipe.cfg
+    dtype = pipe.dtype
+    N = int(cfg.smc_num_particles)
+    n_dim = pipe.n_dim
+    target_ess = float(cfg.smc_target_ess_frac) * N
+    t_start = time.perf_counter()
+
+    key, sub = jax.random.split(key)
+    # oversampled cold-init draw: _init_state rejects the non-converged corners and
+    # culls back to N healthy particles (resume overwrites U from the checkpoint below)
+    U = pipe.sample_prior_u(sub, _init_draw_count(pipe, N))
+
+    step = tune_step_size(pipe, key) if (cfg.mcmc_auto_tune and not cfg.mcmc_stage_adapt) else float(cfg.mala_step_size)
+    log_step = math.log(min(max(step, cfg.mcmc_step_size_min), cfg.mcmc_step_size_max))
+    scale = np.ones(n_dim)
+    mutate = _make_mutation(pipe, int(cfg.smc_num_mcmc_steps))
+
+    beta = 0.0
+    betas: List[float] = [0.0]
+    ess_hist, acc_hist, logz_inc_hist, step_hist, uniq_hist = [], [], [], [], []
+    logZ = 0.0
+
+    state_loaded = False
+    if resume_from is not None and Path(resume_from).exists():
+        ck = np.load(resume_from)
+        if ck["u_particles"].shape != (N, n_dim):
+            raise ValueError(f"checkpoint particles {ck['u_particles'].shape} != ({N},{n_dim}); "
+                             "resume requires the same smc_num_particles and parameter set")
+        U = jnp.asarray(ck["u_particles"], dtype)
+        betas = [float(b) for b in ck["betas"]]
+        beta = betas[-1]
+        ess_hist = [float(x) for x in ck["ess"]]
+        acc_hist = [float(x) for x in ck["acceptance_rate"]]
+        logz_inc_hist = [float(x) for x in ck["logZ_increment"]]
+        step_hist = [float(x) for x in ck["step_size_history"]]
+        uniq_hist = [int(x) for x in ck["unique_particles"]]
+        logZ = float(ck["logZ"])
+        scale = np.asarray(ck["scale_diag"], np.float64)
+        if step_hist:
+            log_step = math.log(min(max(step_hist[-1], cfg.mcmc_step_size_min), cfg.mcmc_step_size_max))
+        if all(k in ck.files for k in ("y_state", "chem_refs", "loglik", "grad_u")):
+            Y = jnp.asarray(ck["y_state"], dtype)
+            refs = jnp.asarray(ck["chem_refs"], dtype)
+            L = jnp.asarray(ck["loglik"], dtype)
+            G = jnp.asarray(ck["grad_u"], dtype)
+            state_loaded = True
+        else:
+            logger.warning("checkpoint predates the carried chemistry state; "
+                           "cold re-initializing at the resumed cloud (warm history "
+                           "is NOT recovered -- likelihoods re-anchor to the cold map)")
+        logger.info(f"RESUMED from {resume_from}: stage {len(betas)-1}, beta={beta:.4f}, logZ={logZ:.2f}")
+
+    if not state_loaded:
+        # one batched cold two-stage solve per particle: the ONLY solve-from-baseline
+        # work in the whole run (every mutation proposal warm-continues from here)
+        t0 = time.perf_counter()
+        U, L, G, Y, refs = _init_state(pipe, U, target_n=N)
+        jax.block_until_ready(L)
+        logger.info(f"Initialized particle state (cold likelihood + move-map gradient) "
+                    f"in {time.perf_counter()-t0:.1f}s")
+
+    logger.info("starting tempering ladder (stage 0 includes the one-time "
+                "mutation-kernel compile)")
+    it = range(int(cfg.smc_max_steps))
+    if progress:
+        try:
+            from tqdm.auto import tqdm
+            it = tqdm(it, desc="adaptive tempered SMC", leave=True)
+        except Exception:
+            pass
+
+    for i in it:
+        # (1) carried likelihood at current particles -> (2) next temperature via ESS
+        # bisection (L travels with the particles; nothing is re-evaluated here)
+        L_np = np.asarray(jax.device_get(L), np.float64)
+        if not np.all(np.isfinite(L_np)):
+            L_np = np.where(np.isfinite(L_np), L_np, -1e30)
+        dbeta = _next_dbeta(L_np, beta, target_ess)
+        beta_new = min(1.0, beta + dbeta)
+        # (2) evidence increment + weights (uniform prior weights each stage post-resample)
+        a = dbeta * (L_np - L_np.max())
+        w = np.exp(a); w_sum = w.sum()
+        logZ_inc = float(dbeta * L_np.max() + math.log(w_sum) - math.log(N)) if w_sum > 0 else float("nan")
+        logZ += 0.0 if not math.isfinite(logZ_inc) else logZ_inc
+        w_norm = w / w_sum if w_sum > 0 else np.full(N, 1.0 / N)
+        ess = float(1.0 / np.sum(w_norm * w_norm))
+        # (3) systematic resample (the carried state travels with its particle)
+        key, sub = jax.random.split(key)
+        idx = _systematic_resample_idx(sub, jnp.asarray(w_norm, dtype), N)
+        U, Y, refs, L, G = U[idx], Y[idx], refs[idx], L[idx], G[idx]
+        # (3.5) preconditioner from the freshly RESAMPLED cloud (absolute per-dim
+        # width: the proposal tracks the tempered posterior as it narrows)
+        if cfg.mcmc_stage_adapt:
+            scale = _abs_scale_diag(np.asarray(jax.device_get(U)), cap=float(cfg.mcmc_scale_clip))
+        # (4) mutate at the new temperature
+        key, sub = jax.random.split(key)
+        U, Y, refs, L, G, acc, n_bad = mutate(sub, U, Y, refs, L, G,
+                                              jnp.asarray(beta_new, dtype),
+                                              jnp.asarray(math.exp(log_step), dtype),
+                                              jnp.asarray(scale, dtype))
+        jax.block_until_ready(U)
+        _check_mutation_health(n_bad, f"SMC stage {i} (beta={beta_new:.3e})")
+        acc_f = float(jax.device_get(acc))
+        U_np = np.asarray(jax.device_get(U), np.float64)
+        n_uniq = int(np.unique(np.round(U_np, 9), axis=0).shape[0])
+        # (5) Robbins-Monro step-size trim toward the target acceptance (fine-tuning
+        # only -- the width is carried by the absolute preconditioner above)
+        if cfg.mcmc_stage_adapt and math.isfinite(acc_f):
+            log_step += float(cfg.mcmc_stage_adapt_gain) * (acc_f - float(cfg.mcmc_target_accept_mala))
+            log_step = math.log(min(max(math.exp(log_step), cfg.mcmc_step_size_min), cfg.mcmc_step_size_max))
+
+        beta = beta_new
+        betas.append(beta); ess_hist.append(ess); acc_hist.append(acc_f)
+        logz_inc_hist.append(logZ_inc); step_hist.append(math.exp(log_step)); uniq_hist.append(n_uniq)
+        elapsed = time.perf_counter() - t_start
+        if hasattr(it, "set_postfix"):
+            it.set_postfix(beta=f"{beta:.2e}", ess=f"{ess:.0f}", acc=f"{acc_f:.2f}")
+        logger.info(f"SMC {i:03d}: beta={beta:.3e} ESS={ess:.1f}/{N} accept={acc_f:.3f} "
+                    f"unique={n_uniq}/{N} step={math.exp(log_step):.3g} logZ={logZ:.2f} "
+                    f"elapsed={elapsed/60:.1f}min")
+
+        if checkpoint_path is not None:
+            theta_ck = np.asarray(jax.device_get(jax.vmap(pipe.theta_from_u)(U)), np.float64)
+            tmp = Path(checkpoint_path).with_suffix(".tmp.npz")
+            save_npz(tmp, u_particles=U_np, theta_particles=theta_ck,
+                     betas=np.asarray(betas), ess=np.asarray(ess_hist),
+                     acceptance_rate=np.asarray(acc_hist), logZ_increment=np.asarray(logz_inc_hist),
+                     step_size_history=np.asarray(step_hist), unique_particles=np.asarray(uniq_hist, np.int64),
+                     scale_diag=np.asarray(scale), last_step=np.asarray(i, np.int64),
+                     logZ=np.asarray(logZ),
+                     # carried per-particle state: resume warm-continues without re-init
+                     y_state=np.asarray(jax.device_get(Y), np.float64),
+                     chem_refs=np.asarray(jax.device_get(refs), np.float64),
+                     loglik=np.asarray(jax.device_get(L), np.float64),
+                     grad_u=np.asarray(jax.device_get(G), np.float64))
+            tmp.replace(checkpoint_path)
+
+        if beta >= 1.0 - 1e-8:
+            break
+        if walltime_seconds and elapsed > walltime_seconds:
+            logger.warning(f"walltime budget {walltime_seconds/3600:.1f}h exceeded at stage {i} "
+                           f"(beta={beta:.3f}); stopping cleanly with partial posterior.")
+            break
+
+    reached = beta >= 1.0 - 1e-6
+    # posterior draws: at beta=1 particles are equally weighted; sample with replacement.
+    n_draws = int(cfg.num_chains) * int(cfg.num_samples)
+    key, sub = jax.random.split(key)
+    draw_idx = np.asarray(jax.device_get(jax.random.choice(sub, N, (n_draws,), replace=True)))
+    theta_draws = np.asarray(jax.device_get(jax.vmap(pipe.theta_from_u)(U)), np.float64)[draw_idx]
+    theta_draws = theta_draws.reshape(int(cfg.num_chains), int(cfg.num_samples), n_dim)
+
+    return dict(
+        U=np.asarray(jax.device_get(U), np.float64), reached_beta1=reached, final_beta=beta,
+        step_size_used=math.exp(log_step), betas=np.asarray(betas),
+        ess=np.asarray(ess_hist), acceptance_rate=np.asarray(acc_hist),
+        logZ_increment=np.asarray(logz_inc_hist), logZ=logZ,
+        step_size_history=np.asarray(step_hist), unique_particles=np.asarray(uniq_hist, np.int64),
+        scale_diag_final=np.asarray(scale), theta_draws=theta_draws,
+    )

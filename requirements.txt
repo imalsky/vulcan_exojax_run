@@ -1,0 +1,13 @@
+# Tested with Python 3.11, jax/jaxlib 0.6.2, numpy 1.26.4, scipy 1.17.1 (2026-07).
+# ExoJax is a plain pip dependency -- its files are never vendored here; it downloads
+# HITRAN line lists / CIA tables into data/ caches on first use.
+# VULCAN-JAX is pinned to a commit of the public repo so `pip install -r` reproduces
+# the exact chemistry this code was validated against (bump the pin deliberately).
+jax>=0.6.2
+exojax==2.2.3
+numpy>=1.26
+scipy>=1.11
+matplotlib
+corner
+tqdm
+vulcan-jax @ git+https://github.com/imalsky/jax-vulcan.git@4db8b053d73826a05af19cafe8955dd28662b41c

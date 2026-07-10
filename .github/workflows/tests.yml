@@ -1,0 +1,24 @@
+name: tests
+
+# Fast, dependency-light CI: exercises the sampler core, u-space prior machinery,
+# binning matrix, and init reject-and-cull logic on stub pipelines (CPU jax only).
+# The chemistry/RT integration tests (test_warm_reject, ...) skip cleanly without
+# the VULCAN-JAX + ExoJax stack and its opacity caches -- those run locally / on HPC.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install minimal deps (no chemistry/RT stack)
+        run: pip install "jax>=0.6" numpy scipy pytest
+      - name: Run stub-pipeline unit tests
+        run: python -m pytest retrieval_framework/tests -q -ra

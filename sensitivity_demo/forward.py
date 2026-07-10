@@ -1,0 +1,53 @@
+"""Compose the full differentiable chain:  theta -> converged VMR -> transit spectrum.
+
+    forward(theta) = transmission_depth( bridge( converged_ymix(theta), T(theta) ) )
+
+theta = [lnZ, c_o, lnKzz, T_int]. The returned ``forward`` is one pure-JAX function
+through which ``jax.jvp`` / ``jax.jacfwd`` push forward-mode tangents end-to-end -- from
+the physics parameters all the way to ``(R_p(lambda)/R_star)^2``.
+
+Importing this module triggers the env-ordered VULCAN-JAX setup (via vulcan_chem) before
+any exojax import, which is the required order.
+"""
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+from types import SimpleNamespace
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # vulcan_exojax_run/ (config, vulcan_chem, ...)
+import config                 # pure constants, no heavy imports
+import vulcan_chem            # sets env + jax x64; must import before exojax
+import jax.numpy as jnp
+
+import exojax_rt
+import interp_map
+
+
+def build_forward(profile: dict) -> SimpleNamespace:
+    """Build ``forward(theta)`` and return it alongside the chem/rt sub-models.
+
+    Returns SimpleNamespace with: forward, chem, rt, mol_cols, h2_col.
+    """
+    chem = vulcan_chem.build_chem_model(profile)
+    rt = exojax_rt.build_rt_model(profile)
+    to_art = interp_map.make_to_art(chem.p_bar, rt.p_art_bar)
+
+    mol_cols = {key: chem.sidx[config.MOLECULES[key]["vulcan"]] for key in rt.molecules}
+    h2_col = chem.sidx[config.BULK_H2_VULCAN]
+    T_base_j = jnp.asarray(chem.T_base)
+    species_masses = chem.species_masses
+
+    def forward(theta):
+        ymix = chem.converged_ymix(theta)                 # (nz, ni)
+        T_v = T_base_j + theta[3]                          # same perturbed T as chemistry
+        mmw_v = ymix @ species_masses                      # (nz,)
+
+        T_art = to_art(T_v)
+        mmw_art = to_art(mmw_v)
+        vmr = {key: to_art(ymix[:, col]) for key, col in mol_cols.items()}
+        vmr_h2 = to_art(ymix[:, h2_col])
+        return rt.transmission_depth(vmr, vmr_h2, T_art, mmw_art)
+
+    return SimpleNamespace(forward=forward, chem=chem, rt=rt,
+                           mol_cols=mol_cols, h2_col=h2_col)
