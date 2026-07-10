@@ -47,6 +47,9 @@ from pathlib import Path
 
 import numpy as np
 
+# np.trapz was renamed np.trapezoid in NumPy 2.0 (and trapz removed); support both.
+_trapezoid = getattr(np, "trapezoid", None) or np.trapz
+
 ROOT = Path("/Users/imalsky/Desktop/Emulators/VULCAN_Project")
 RUN = ROOT / "vulcan_exojax_run"
 DEMO_OUT = RUN / "data"   # exojax demo npz consolidated into the run bundle
@@ -123,7 +126,7 @@ def bin_to_grid(centers, edges, wl, depth, J):
         inside = (wl > lo) & (wl < hi)
         x = np.concatenate([[lo], wl[inside], [hi]])
         y = np.column_stack([np.interp(x, wl, Y[:, k]) for k in range(Y.shape[1])])
-        avg = np.trapezoid(y, x, axis=0) / (hi - lo)
+        avg = _trapezoid(y, x, axis=0) / (hi - lo)
         db[b] = avg[0]
         Jb[b] = avg[1:]
     keep = np.isfinite(db)

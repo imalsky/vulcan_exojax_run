@@ -1,13 +1,15 @@
 """The binning MATRIX must reproduce the d(lambda)-weighted trapezoidal bin average
 (zco_lib.bin_to_obs's operation) exactly -- that equivalence is what makes the binned
-depth's jvp exact and free. Reference implemented locally with np.trapz (this env's
-numpy 1.26 has no np.trapezoid)."""
+depth's jvp exact and free."""
 from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
 
 from retrieval_framework import observations as OBS
+
+# np.trapz was renamed np.trapezoid in NumPy 2.0 (and trapz removed); support both.
+_trapezoid = getattr(np, "trapezoid", None) or np.trapz
 
 
 def _reference_bin(wl_model, y, lo_all, hi_all):
@@ -23,7 +25,7 @@ def _reference_bin(wl_model, y, lo_all, hi_all):
         inside = (wl > lo) & (wl < hi)
         x = np.concatenate([[lo], wl[inside], [hi]])
         yy = np.interp(x, wl, Y)
-        out[b] = np.trapz(yy, x) / (hi - lo)
+        out[b] = _trapezoid(yy, x) / (hi - lo)
     return out
 
 

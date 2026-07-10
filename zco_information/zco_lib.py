@@ -39,6 +39,9 @@ from pathlib import Path
 
 import numpy as np
 
+# np.trapz was renamed np.trapezoid in NumPy 2.0 (and trapz removed); support both.
+_trapezoid = getattr(np, "trapezoid", None) or np.trapz
+
 ROOT = Path(os.environ.get(   # VULCAN_PROJECT_ROOT makes the bundle HPC-portable
     "VULCAN_PROJECT_ROOT", "/Users/imalsky/Desktop/Emulators/VULCAN_Project"))
 DATA = ROOT / "vulcan_exojax_run" / "data"   # run-bundle caches (zco_jacobians/zco_walk) + cm24 obs
@@ -158,7 +161,7 @@ def bin_to_obs(wl_model, cols, obs):
         inside = (wl > lo) & (wl < hi)
         x = np.concatenate([[lo], wl[inside], [hi]])
         y = np.column_stack([np.interp(x, wl, Y[:, k]) for k in range(Y.shape[1])])
-        out[b] = np.trapezoid(y, x, axis=0) / (hi - lo)
+        out[b] = _trapezoid(y, x, axis=0) / (hi - lo)
     keep = np.all(np.isfinite(out), axis=1)
     return keep, out
 
