@@ -15,8 +15,9 @@ measured support fraction (`logZ_box = logZ + ln f` in results/npz; init cull co
 persisted through checkpoints), per-sweep/stage `warmcap=` counters, tempered-draw
 labels on every output path, validate_warm gates on logL + spectrum-ppm + inventories,
 jwst_tool v5 (floor-aware transits, R=100-anchored floors, offset-marginalized detect,
-saturation-consistent Fisher; `_VERSION=5`). Bundle is pip-installable
-(`pip install -e .`, console script `jwst-tool`).
+saturation-consistent Fisher; `_VERSION=5`). The repo is a two-package monorepo since
+2026-07-11: `pip install --no-deps -e ./vulcan-retrieval -e ./vulcan-jwst-tool`
+(console script `jwst-tool`); see "Layout / entry points" below.
 
 Operational consequences:
 - **The chemistry map changed** (elemental + atm rebuild): synthetic obs, demo npz
@@ -25,7 +26,7 @@ Operational consequences:
   map (likelihoods re-anchor mid-run). `overwrite=True` handles synthetic obs.
 - **Before the next production run**: `PROBE_MEMORY=1` (the evaluator gained small
   per-proposal structure rebuilds), then the smoke chain + suite, then on the GPU node
-  the new validation set: `validation/elemental_audit.py`,
+  the new validation set: `vulcan-retrieval/validation/elemental_audit.py`,
   `resolution_ladder.py`, `top_pressure_ladder.py --extend-chem`,
   `broadening_ab.py`, and post-run `validate_warm` + `mala_reversibility.py`.
 - **`h2he` broadening** downloads separate `<db>_h2he` line-list caches on first use
@@ -42,6 +43,11 @@ git pull --ff-only
 cd ../VULCAN-JAX
 git pull --ff-only
 ```
+
+The first pull of the 2026-07-11 two-package restructure needs no manual install step:
+the PBS preflight now `pip install --user --no-deps -e`'s both VULCAN-JAX and
+vulcan-retrieval from the synced trees (idempotent) and HARD-fails if a stale user-site
+vulcan-jax shadows the clone. Later pulls need nothing (editable installs track the tree).
 
 One-time setup (front end). MEASURED 2026-07-10 on cghfe02: **direct https to
 github.com works and the proxy hostname does NOT resolve** -- make sure
@@ -99,7 +105,7 @@ gives util/power/clocks without it. Also: `NSYS_DELAY` is in **seconds** (64604 
 
 ## Retrieval — critical decisions (2026-07-08)
 
-- **count_max = 5000, always** (lowered from 10000, Isaac 2026-07-08). Set in `runs/w39b_smc_retrieval/case.py::gpu_config`;
+- **count_max = 5000, always** (lowered from 10000, Isaac 2026-07-08). Set in `vulcan-retrieval/runs/w39b_smc_retrieval/case.py::gpu_config`;
   every override file falls back to it. Do NOT raise it. A solve that doesn't converge in
   5k accepted steps is a **failed draw** — acceptable, not a bug to chase: it is REJECTED
   at init and the cloud is oversampled to compensate (see "Cold-init reject-and-cull").
@@ -158,7 +164,7 @@ pass on the N survivors only, and RAISES only if fewer than N survive (systemic)
 behavior (raise at >10%, or carry unconverged states as finite L) is gone — carrying a
 non-converged spectrum is a silent bias, rejecting it is correct. `init_max_nonconverged_frac`
 is now just a WARNING threshold on the observed reject fraction. Unit-tested in
-`retrieval_framework/tests/test_init_state.py` (5 tests: reject, cull, raise-if-too-few,
+`vulcan-retrieval/tests/test_init_state.py` (5 tests: reject, cull, raise-if-too-few,
 oversample count). Full suite 14/14 green.
 
 **FIXED 2026-07-09 (was the deferred residual, and it was NOT low-risk):** a warm MALA
@@ -288,7 +294,7 @@ tolerance, so it is only approximately pi_beta-invariant — the one substantive
 from the external review. The measurement tool is `validate_warm`:
 
 ```
-SMC_RETRIEVAL_PRESET=gpu python -m retrieval_framework.validate_warm runs/w39b_smc_retrieval
+SMC_RETRIEVAL_PRESET=gpu python -m retrieval_framework.validate_warm vulcan-retrieval/runs/w39b_smc_retrieval
 ```
 
 It cold re-solves the checkpointed cloud (init phase-1-equivalent, ~minutes) and
@@ -376,11 +382,29 @@ upstream's default that PRESERVES the longdy-defined steady state (truth bit-ide
   logs the per-draw θ of every censored draw. Expect it to be much smaller now that the
   hottest (out-of-window) draws are rejected before the chemistry and yconv_cri is 0.01.
 
-## Layout / entry points
+## Layout / entry points (two-package monorepo since 2026-07-11)
 
-- Framework: `retrieval_framework/` (planet-agnostic). Cases: `runs/<case>/case.py`.
-- Run from the bundle dir: `python -m retrieval_framework.run_smc runs/w39b_smc_retrieval`
+- `vulcan-retrieval/` (dist vulcan-retrieval, import `retrieval_framework`, src layout):
+  the SMC framework at `src/retrieval_framework/`, the shared forward-model engine at
+  `src/retrieval_framework/forward/` (config, vulcan_chem, exojax_rt, interp_map,
+  sensitivity -- the old flat bundle modules; import as
+  `from retrieval_framework.forward import config`). Cases: `vulcan-retrieval/runs/<case>/case.py`.
+  Also `tests/`, `examples/` (ex sensitivity_demo), `validation/`, `scripts/zco_information/`.
+- `vulcan-jwst-tool/` (dist vulcan-jwst-tool, import `jwst_tool`, src layout): the
+  Streamlit instrument selector; console script `jwst-tool`.
+- Both MUST be installed editable (`pip install --no-deps -e ./vulcan-retrieval
+  -e ./vulcan-jwst-tool`; --no-deps because vulcan-jax is TestPyPI-only). The old
+  sys.path "bundle import contract" is GONE: vulcan_chem no longer inserts
+  VULCAN-JAX/src, so vulcan_jax resolves via its own (editable) install -- the PBS
+  preflight installs and hard-checks this on NAS.
+- Import order is guard-enforced: `retrieval_framework.forward.vulcan_chem` raises if
+  exojax was imported first.
+- Run from the repo root:
+  `python -m retrieval_framework.run_smc vulcan-retrieval/runs/w39b_smc_retrieval`
   (also `calibrate_count_max`, `probe_memory`, `smoke_retrieval`, `plot_smc`,
-  `validate_warm`).
-- `config.py` / `zco_lib.py` roots are portable via `$VULCAN_PROJECT_ROOT`.
+  `validate_warm`). Suite: `python -m pytest vulcan-retrieval/tests -q`.
+- `data/` stays at the REPO ROOT (NAS-seeded caches unchanged); roots are portable via
+  `$VULCAN_PROJECT_ROOT` (forward/config.py raises loudly if the data tree is missing).
+- Historical/design-log content lives in per-directory `notes.md` files (user
+  convention, 2026-07-11); READMEs carry current usage only, one per package.
 - Figures still go to `../jax_paper/figures/`; never modify `../VULCAN-JAX`.

@@ -19,6 +19,10 @@ jobs:
         with:
           python-version: "3.11"
       - name: Install minimal deps (no chemistry/RT stack)
-        run: pip install "jax>=0.6" numpy scipy pytest
+        # --no-deps: vulcan-jax lives on TestPyPI, a plain editable install would
+        # try (and fail) to resolve it from PyPI; the stub tests don't need it.
+        run: |
+          pip install "jax>=0.6" numpy scipy pytest
+          pip install --no-deps -e vulcan-retrieval
       - name: Run stub-pipeline unit tests
-        run: python -m pytest retrieval_framework/tests -q -ra
+        run: python -m pytest vulcan-retrieval/tests -q -ra

@@ -16,18 +16,18 @@
 # against the real Carter & May (2024) NIRISS+G395H spectrum.
 #
 # Same node/env pattern as the working SWAMPE WASP-43b retrieval PBS and the
-# VULCAN-JAX GPU benchmark PBS (shared conda env pyt2_8_gh + pip --user
-# vulcan-jax on /nobackup, GH200 XLA knobs from the validated benchmark).
+# VULCAN-JAX GPU benchmark PBS (shared conda env pyt2_8_gh + editable --user
+# installs of the synced trees, GH200 XLA knobs from the validated benchmark).
 #
-# Expected layout on /nobackup (scp -r the local tree; NEVER rsync -- see CLAUDE.md):
-#   ${PROJECT_ROOT}/VULCAN-JAX/                          (repo, src/ importable)
-#   ${PROJECT_ROOT}/vulcan_exojax_run/                   (bundle: shared lib + data/)
-#   ${PROJECT_ROOT}/vulcan_exojax_run/retrieval_framework/         (reusable SMC framework)
-#   ${PROJECT_ROOT}/vulcan_exojax_run/runs/w39b_smc_retrieval/   (THIS case dir)
-#   (CO ExoMol + H2-H2/H2-He CIA cache lives IN the bundle: no other dependency needed)
+# Expected layout on /nobackup (git pull for code, scp/cp for data -- see CLAUDE.md):
+#   ${PROJECT_ROOT}/VULCAN-JAX/                                    (chemistry repo)
+#   ${PROJECT_ROOT}/vulcan_exojax_run/                             (this repo; data/ at its root)
+#   ${PROJECT_ROOT}/vulcan_exojax_run/vulcan-retrieval/            (retrieval package)
+#   ${PROJECT_ROOT}/vulcan_exojax_run/vulcan-retrieval/runs/w39b_smc_retrieval/  (THIS case dir)
+#   (CO ExoMol + H2-H2/H2-He CIA cache lives in the repo data/: no other dependency needed)
 #
 # Submit (from this case dir, or export PROJECT_ROOT):
-#   cd /nobackup/$USER/VULCAN_Project/vulcan_exojax_run/runs/w39b_smc_retrieval
+#   cd /nobackup/$USER/VULCAN_Project/vulcan_exojax_run/vulcan-retrieval/runs/w39b_smc_retrieval
 #   qsub run_nas_w39b.pbs                        # real-data production run
 #   qsub -v SYNTH=1 run_nas_w39b.pbs             # gpu-fidelity synthetic recovery test
 #   qsub -v CALIBRATE_ONLY=1 run_nas_w39b.pbs    # timing projection only (~1 h)
@@ -60,7 +60,7 @@
 # max|dlogL| < 0.1) run automatically; the verdict lands in the log + validate_warm.npz.
 #
 # XLA A/B experiments (launch-overhead reduction; the GPU sits at ~300-390 W of 700 W,
-# so per-step overhead is the speed lever -- see ../../CLAUDE.md "GPU power headroom").
+# so per-step overhead is the speed lever -- see the repo-root CLAUDE.md "GPU power headroom").
 # Judge purely by t_mutation_sweep_s in timing.json vs a baseline calibration:
 #   qsub -v CALIBRATE_ONLY=1,XLA_FLAGS='--xla_gpu_enable_triton_gemm=false --xla_gpu_autotune_level=4' run_nas_w39b.pbs
 #   qsub -v CALIBRATE_ONLY=1,XLA_FLAGS='--xla_gpu_enable_triton_gemm=false --xla_gpu_autotune_level=0 --xla_gpu_enable_command_buffer=FUSION,CUBLAS,CUSTOM_CALL,WHILE' run_nas_w39b.pbs
@@ -71,17 +71,18 @@ set -euo pipefail
 
 # --- locate the project root (PBS spools the script; rely on PBS_O_WORKDIR) ---
 if [ -n "${PROJECT_ROOT:-}" ]; then :
-elif [ -n "${PBS_O_WORKDIR:-}" ] && [ -d "${PBS_O_WORKDIR}/vulcan_exojax_run/runs/w39b_smc_retrieval" ]; then
+elif [ -n "${PBS_O_WORKDIR:-}" ] && [ -d "${PBS_O_WORKDIR}/vulcan_exojax_run/vulcan-retrieval/runs/w39b_smc_retrieval" ]; then
   PROJECT_ROOT="${PBS_O_WORKDIR}"
 elif [ -n "${PBS_O_WORKDIR:-}" ] && [ "$(basename "${PBS_O_WORKDIR}")" = "w39b_smc_retrieval" ]; then
-  PROJECT_ROOT="$(cd -- "${PBS_O_WORKDIR}/../../.." && pwd -P)"
+  # case dir -> runs -> vulcan-retrieval -> repo -> PROJECT_ROOT: four levels up
+  PROJECT_ROOT="$(cd -- "${PBS_O_WORKDIR}/../../../.." && pwd -P)"
 else
-  echo "ERROR: set PROJECT_ROOT or submit from .../vulcan_exojax_run/runs/w39b_smc_retrieval"
+  echo "ERROR: set PROJECT_ROOT or submit from .../vulcan_exojax_run/vulcan-retrieval/runs/w39b_smc_retrieval"
   exit 1
 fi
-SMC_DIR="${PROJECT_ROOT}/vulcan_exojax_run/runs/w39b_smc_retrieval"    # this case
-BUNDLE_DIR="${PROJECT_ROOT}/vulcan_exojax_run"                         # shared lib + retrieval_framework/
-if [ ! -f "${SMC_DIR}/case.py" ] || [ ! -f "${BUNDLE_DIR}/retrieval_framework/run_smc.py" ]; then
+REPO_DIR="${PROJECT_ROOT}/vulcan_exojax_run"                           # repo root (data/ lives here)
+SMC_DIR="${REPO_DIR}/vulcan-retrieval/runs/w39b_smc_retrieval"         # this case
+if [ ! -f "${SMC_DIR}/case.py" ] || [ ! -f "${REPO_DIR}/vulcan-retrieval/src/retrieval_framework/run_smc.py" ]; then
   echo "ERROR: case.py / retrieval framework not found under PROJECT_ROOT=${PROJECT_ROOT}"
   exit 1
 fi
@@ -144,6 +145,13 @@ python -c "import exojax" 2>/dev/null || python -m pip install --user "exojax==2
 python -c "import corner" 2>/dev/null || python -m pip install --user corner || true
 python -c "import tqdm"   2>/dev/null || python -m pip install --user tqdm   || true
 
+# vulcan_jax and retrieval_framework MUST resolve to the git-synced trees. The old
+# sys.path fallback in vulcan_chem is gone, so a stale `pip --user` vulcan-jax would
+# silently win -- install both EDITABLE (idempotent; `git pull --ff-only` stays the
+# code-deploy mechanism, nothing to reinstall on later pulls).
+python -m pip install --user --no-deps -e "${PROJECT_ROOT}/VULCAN-JAX"
+python -m pip install --user --no-deps -e "${REPO_DIR}/vulcan-retrieval"
+
 python - <<'PY' || { echo "ERROR: runtime preflight failed."; exit 1; }
 import os, sys
 from pathlib import Path
@@ -153,18 +161,21 @@ be = jax.default_backend()
 print(f"jax {jax.__version__} backend={be} devices={jax.devices()}")
 if be not in ("gpu", "cuda", "rocm"):
     print("ERROR: JAX is not on the GPU", file=sys.stderr); ok = False
-try:
-    import vulcan_jax
-    print("vulcan_jax", vulcan_jax.__version__, "from", Path(vulcan_jax.__file__).parent)
-except Exception as e:
-    print(f"NOTE: installed vulcan_jax not importable ({e}); the repo tree will be used "
-          "via sys.path (vulcan_chem inserts VULCAN-JAX/src).")
+root = Path(os.environ["VULCAN_PROJECT_ROOT"])
+import vulcan_jax
+_vj = Path(vulcan_jax.__file__).resolve()
+print("vulcan_jax", vulcan_jax.__version__, "from", _vj.parent)
+if not str(_vj).startswith(str((root / "VULCAN-JAX").resolve())):
+    print(f"ERROR: vulcan_jax resolves to {_vj}, not the synced tree under "
+          f"{root}/VULCAN-JAX. A stale user-site install is shadowing it; fix with:\n"
+          f"  python -m pip install --user --no-deps --force-reinstall -e {root}/VULCAN-JAX",
+          file=sys.stderr); ok = False
+import retrieval_framework
+from retrieval_framework.forward import config as _fwd_config
+print("retrieval_framework", retrieval_framework.__version__,
+      "from", Path(retrieval_framework.__file__).parent)
 import exojax
 print("exojax", exojax.__version__)
-root = Path(os.environ["VULCAN_PROJECT_ROOT"])
-jaxroot = root / "VULCAN-JAX" / "src" / "vulcan_jax"
-if not jaxroot.is_dir():
-    print(f"ERROR: missing repo tree {jaxroot}", file=sys.stderr); ok = False
 cm24 = root / "vulcan_exojax_run" / "data" / "cm24_wasp39b"
 if not any(cm24.glob("*.csv")):
     print(f"ERROR: missing real spectrum CSVs in {cm24}", file=sys.stderr); ok = False
@@ -294,7 +305,7 @@ if [ "${SYNTH:-0}" = "1" ]; then
 fi
 echo "preset=${SMC_RETRIEVAL_PRESET} overrides=${SMC_RETRIEVAL_OVERRIDES:-<none>}"
 
-cd -P "${BUNDLE_DIR}"   # `python -m retrieval_framework.*` + bare-name imports resolve from here
+cd -P "${REPO_DIR}"   # stable cwd only; retrieval_framework is installed, imports need no cwd
 
 rc=0
 if [ "${PROBE_MEMORY:-0}" = "1" ]; then

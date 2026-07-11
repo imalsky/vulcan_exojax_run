@@ -1,8 +1,11 @@
-# Tested with Python 3.11, jax/jaxlib 0.6.2, numpy 1.26.4, scipy 1.17.1 (2026-07).
-# ExoJax is a plain pip dependency -- its files are never vendored here; it downloads
-# HITRAN line lists / CIA tables into data/ caches on first use.
-# VULCAN-JAX is pinned to a commit of the public repo so `pip install -r` reproduces
-# the exact chemistry this code was validated against (bump the pin deliberately).
+# HPC-reproducibility pins (the PBS flow; tested Python 3.11, jax/jaxlib 0.6.2,
+# numpy 1.26.4, scipy 1.17.1, 2026-07). The package metadata (vulcan-retrieval's
+# pyproject) declares vulcan-jax>=0.1.17 for TestPyPI; THIS file carries the exact
+# validated chemistry commit -- bump the pin deliberately.
+# ExoJax is a plain pip dependency; it downloads HITRAN line lists / CIA tables
+# into the repo data/ caches on first use.
+# NOTE the PBS preflight installs the SYNCED trees editable instead (git pull is
+# the code-deploy mechanism); use this file for a standalone reproduction env.
 jax>=0.6.2
 exojax==2.2.3
 numpy>=1.26
@@ -11,3 +14,4 @@ matplotlib
 corner
 tqdm
 vulcan-jax @ git+https://github.com/imalsky/jax-vulcan.git@4db8b053d73826a05af19cafe8955dd28662b41c
+-e ./vulcan-retrieval

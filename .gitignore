@@ -12,10 +12,16 @@ data/exojax_linelists/
 data/opacity_cache/
 
 # Run outputs (posteriors, checkpoints, logs, PBS job logs) -- regenerated per run
-runs/*/data/
-runs/*/logs/
-runs/*/*.o[0-9]*
+vulcan-retrieval/runs/*/data/
+vulcan-retrieval/runs/*/logs/
+vulcan-retrieval/runs/*/plots/
+vulcan-retrieval/runs/*/*.o[0-9]*
 *.nsys-rep
+
+# Generated npz caches (sensitivity/zco jacobians/walk) -- scientifically versioned
+# by the code that writes them, regenerable, and easy to leave stale in git (the
+# tracked set was deleted as stale 2026-07-11); never re-track them.
+data/*.npz
 
 # Editor / OS noise
 .vscode/
