@@ -2,10 +2,10 @@
 
 CO-only opacity (cached), coarse column (nz=40), loose convergence, photo on. Proves:
   1. the composed forward(theta) runs and returns a finite, physically-sane spectrum;
-  2. all four parameter tangents (lnZ, C/O, lnKzz, T_int) are finite through the whole
+  2. all four parameter tangents (lnZ, C/O, lnKzz, dT) are finite through the whole
      chain (chemistry lax.while_loop -> log-P bridge -> ArtTransPure);
   3. the end-to-end forward-mode derivative matches a re-converged central finite
-     difference at the most-sensitive wavelength for lnZ and T_int (the two knobs that
+     difference at the most-sensitive wavelength for lnZ and dT (the two knobs that
      exercise, respectively, the y0-direction path and the on-graph rates_jax T path).
 
 Run:  (vulcan env)  python smoke_test.py
@@ -29,8 +29,8 @@ import jax.numpy as jnp
 # (param index, eps, name): eps large enough that the signal clears the convergence-
 # noise floor of the central difference (a per-wavelength check is noisier than the
 # column-integrated checks in the reference scripts).
-FD_CHECKS = [(0, 0.02, "lnZ"), (3, 1.0, "T_int")]
-REL_TOL = 0.05  # T_int matches FD to ~1e-5; lnZ to ~2% at this noisier per-wavelength check
+FD_CHECKS = [(0, 0.02, "lnZ"), (3, 1.0, "dT")]
+REL_TOL = 0.05  # dT matches FD to ~1e-5; lnZ to ~2% at this noisier per-wavelength check
 
 
 def main() -> int:

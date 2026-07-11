@@ -80,3 +80,30 @@ def combined_forecast(results: list[dict], free_names: list[str]) -> dict:
         F += (Jg / s[None, :] ** 2) @ Jg.T
     sig = _marg_sigmas(F, n_f)
     return dict(zip(free_names, sig))
+
+
+def transits_to_target(result: dict, free_names: list[str], gp: str,
+                       target_display: float, sigma_at_transits) -> dict:
+    """Smallest transit count at which the marginalized (display-unit) forecast on
+    ``gp`` reaches ``target_display`` -- with the systematic floor respected.
+
+    ``sigma_at_transits(result, n) -> per-bin sigma`` comes from detect.py (photon
+    variance scales 1/N, R-anchored floor does not). Returns
+    dict(n=int|None, reachable=bool, sig_inf=float): ``sig_inf`` is the
+    floor-limited best case (display units); ``n`` is None when the target beats
+    it -- no transit count reaches the target, which the old 1/sqrt(N)
+    extrapolation could never say.
+    """
+    from . import detect as _detect  # local import: fisher stays numpy-only otherwise
+
+    def _sig_with(sigma):
+        r2 = dict(result); r2["sigma"] = sigma
+        return display_sigma(gp, mode_forecast(r2, free_names)[gp])
+
+    sig_inf = _sig_with(np.maximum(np.asarray(result["floor"]), 1e-30))
+    if not np.isfinite(sig_inf) or target_display < sig_inf:
+        return dict(n=None, reachable=False, sig_inf=sig_inf)
+    for n in range(1, _detect.N_TRANSITS_CAP + 1):
+        if _sig_with(sigma_at_transits(result, n)) <= target_display:
+            return dict(n=n, reachable=True, sig_inf=sig_inf)
+    return dict(n=None, reachable=False, sig_inf=sig_inf)

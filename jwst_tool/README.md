@@ -1,10 +1,10 @@
 # jwst_tool — JWST instrument selector (VULCAN-JAX × ExoJAX × Pandeia)
 
 A PandExo-style planning GUI built on the live pipeline in this bundle: pick a
-science goal (detect molecule X, forecast parameter constraints), run the
-VULCAN-JAX photochemistry → ExoJAX transmission model **locally**, simulate each
-JWST time-series mode's transit-depth precision with the **real STScI Pandeia ETC
-engine**, and rank the modes.
+planet and a science goal (detect molecule X, forecast parameter constraints),
+run the VULCAN-JAX photochemistry → ExoJAX transmission model **locally**,
+simulate each JWST time-series mode's transit-depth precision with the **real
+STScI Pandeia ETC engine**, and rank the modes.
 
 ## Launch
 
@@ -13,20 +13,46 @@ cd vulcan_exojax_run
 streamlit run jwst_tool/app.py
 ```
 
-First run of a new parameter set: ~2–3 min (chemistry warm-up ~50 s, ~40 s per
-chemistry solve, ~10 s per RT eval), plus ~20–60 s per freed Fisher parameter.
-Everything is disk-cached (`data/jwst_tool/`): repeat runs are instant.
+First run of a new parameter set: **~2 min at the default "fast" fidelity**
+(~3 min at "high"), plus ~20–60 s per freed Fisher parameter. A progress bar
+tracks the stages (chemistry build → solve → spectra → Jacobians). Everything
+is disk-cached (`data/jwst_tool/`): repeat runs are instant.
+
+## Planets
+
+`planets.py` registry: **WASP-39 b** (the validated Tsai et al. 2023 baseline,
+GCM T-P + Kzz), **HD 189733 b** (very bright host — saturation stress test),
+**HD 209458 b**, **WASP-107 b** (low-gravity super-puff), or a **custom**
+system. Every planet runs the same validated W39b SNCHO network machinery; the
+identity is injected via `cfg_overrides` (gravity, Rp, R_star, orbit distance,
+stellar UV spectrum from the shipped VULCAN library) for the chemistry and
+`rp_cm`/`gs_cgs`/`rstar_cm` for the RT. Non-W39b planets use an isothermal
+structural baseline at a representative temperature and must pick the
+isothermal or Guillot T-P (the GCM baseline + Kzz-scale modes are W39b-only,
+enforced loudly). All system parameters are editable in the GUI.
 
 ## What it computes
 
-- **Forward model** (`forward.py`, subprocess): WIDE-band (1–15 µm, native
-  R≈3000) transmission spectrum of the WASP-39b column, photochemistry ON,
-  molecules H2O/CO2/CO/CH4/SO2. Knobs: metallicity (about the 10× solar
+- **Forward model** (`forward.py`, subprocess): WIDE-band (1–15 µm)
+  transmission spectrum, photochemistry ON by default, molecules
+  H2O/CO2/CO/CH4/SO2 plus opt-in C2H2/H2S/HCN/NH3 (the SNCHO network solves
+  them regardless; opting in adds their opacity + a removed spectrum each).
+  Fidelity tiers: **fast** (default; nz=100, yconv 1e-2 = VULCAN master
+  default, native R≈1500) and **high** (nz=150, yconv 1e-3, native R≈3000);
+  both keep the full 60-layer RT grid. Knobs: metallicity (about the 10× solar
   baseline, `reanchor_atom_ini` + two-stage solve for finite steps), Δln(C/O),
-  Kzz (GCM profile × factor, or constant via `cfg_overrides`), and the T-P
-  profile — baseline+ΔT, isothermal, or Guillot (ExoJax `atmprof_Guillot`,
-  the same hook the retrieval uses). Out-of-window T-P ([320, 2980] K) and
-  count_max-exhausted solves **raise**, they are never clipped/carried.
+  Kzz (GCM profile × factor on W39b, or constant), and the T-P
+  profile — baseline+ΔT (W39b), isothermal, or Guillot (ExoJax
+  `atmprof_Guillot`, the same hook the retrieval uses). Out-of-window T-P
+  ([320, 2980] K) and count_max-exhausted solves **raise**, never clipped/carried.
+- **Physics knobs** (all through the existing validated hooks; defaults = the
+  Tsai 2023 W39b values): photochemistry on/off (off = thermochem+transport
+  only; the Fisher forecast *requires* on — the validated-jvp regime),
+  photolysis zenith angle (83° terminator slant default), diurnal photolysis
+  factor, molecular diffusion on/off. RT side: H2/He Rayleigh scattering (ON
+  by default as of v4 — earlier versions omitted it, biasing the <1.5 µm
+  slope) and an optional ExoJax power-law cloud deck (log κ₀ at 3.5 µm +
+  slope α; held fixed in the Fisher forecast, i.e. no cloud marginalization).
 - **Noise** (`pandeia_worker.py` in the `picaso_base` conda env — pandeia.engine
   3.0 matching the on-disk `pandeia_data-3.0rc3` refdata): per-native-pixel
   extracted flux + noise for a PHOENIX star normalized to the entered Ks mag
@@ -35,12 +61,33 @@ Everything is disk-cached (`data/jwst_tool/`): repeat runs are instant.
   `var = (noise/flux)² (1/n_in + 1/n_out) / n_transits`, inverse-variance
   binned, then a **non-averaging** systematic floor in quadrature (defaults per
   mode, editable; Greene+2016-ish, in-flight performance is often better).
-- **Detection significance**: `σ = √Σ((full − without-X)/σ_bin)²` on each
-  mode's bins (nested-model Δχ² proxy).
-- **Fisher forecast** (`fisher.py`, opt-in): one warm-started forward-mode jvp
-  per freed parameter through the full chain (the validated sensitivity
-  pattern) + an RT-only lnR0 column. Per-mode rows marginalize lnR0; the
-  combined row shares lnR0 and adds one absolute-depth offset nuisance per mode.
+  Floors are quoted **per R=100 bin** and anchored there: finer bins scale the
+  per-bin floor by √(R/100), so the bin slider cannot manufacture
+  floor-limited significance (v5). The photon and floor terms are returned
+  separately, so multi-transit predictions average down only the photon term.
+- **Science goals** (two kinds):
+  - *Detect a molecule*: `σ = √Δχ²` of (full − without-X) on each mode's
+    bins with a free constant depth offset profiled out (v5 — removing a
+    molecule's flat continuum no longer counts as signal; matches the Fisher
+    offset treatment). Still a linearized proxy: the other atmosphere
+    parameters are not re-fit, so it upper-bounds a full retrieval.
+  - *Constrain a parameter*: pick metallicity / C/O / Kzz (or a T-P
+    parameter) + a target 1σ precision; modes ranked by the marginalized
+    Fisher forecast, with transits-needed-to-target per mode and a combined
+    all-modes row.
+- **Fisher forecast** (`fisher.py`; automatic for the constrain goal, opt-in
+  for detect): one warm-started forward-mode jvp per freed parameter through
+  the full chain (the validated sensitivity pattern) + an RT-only lnR0 column.
+  Per-mode rows marginalize lnR0; the combined row shares lnR0 and adds one
+  absolute-depth offset nuisance per mode. Saturated modes are excluded from
+  BOTH the per-mode ranking and the combined row (v5 — previously the combined
+  row silently included them). Model bins are d(λ)-weighted (trapezoid) means,
+  matching the retrieval's exact binning-matrix convention. The GUI includes a
+  "how to read this" explainer (Cramér–Rao best case, no priors, dex units).
+- **Output extras**: T-P profile plot (with the [320, 2980] K opacity-window
+  bounds), per-stage progress bar, reset-all button (nonce-keyed widgets).
+  Default selection is 3 modes (SOSS, G395H, MIRI LRS); the ETC always
+  computes all 7 per star, so adding modes later is instant.
 
 ## Modes
 
@@ -63,7 +110,38 @@ with the saturation numbers, matching the known PRISM brightness limit.
 
 - Model band starts at 1.0 µm (H2-H2 CIA table edge), so SOSS order 1 loses
   0.85–1.0 µm and order 2 is not offered; MIRI LRS is cut at 12 µm.
-- One planet baseline (WASP-39b column, its gravity/radius/star). Other planets
-  need a baked VULCAN baseline + `rp_cm`/`gs_cgs`/`rstar_cm` in the profile.
-- HITRAN line lists (main isotopologue), adequate for planning; not HITEMP/ExoMol.
+- Non-W39b planets: chemistry baseline is 10× solar FastChem EQ on an
+  isothermal structural grid. As of v5 the on-graph T-P drives the FULL
+  chemistry structure per evaluation (rates, n₀, hydrostatic geometry via the
+  runner's in-loop refresh, Dzz/vm) — the one remaining baseline-T bake is the
+  photolysis cross-section T-interpolation (upstream host-side step,
+  second-order). Stellar UV is the nearest shipped spectral type, shown
+  explicitly in the GUI.
+- Registry values are literature planning defaults; edit them for proposals.
+- Default spectra are CLEAR-SKY: the cloud deck is opt-in and OFF by default,
+  so feature amplitudes (and detection significances) are upper limits for
+  planets with muting aerosols (W39b PRISM needed clouds). Turn the deck on
+  to stress-test a goal against clouds; it is not marginalized in the Fisher
+  forecast.
+- "Transits → target" is floor-aware as of v5: the photon term scales 1/N,
+  the R-anchored floor is fixed, and the solver reports **never** when the
+  target exceeds the floor-limited ceiling (the old 1/√N scaling was
+  optimistic exactly where the floor dominated).
+- Fast fidelity matches High on the headline numbers (G395H SO2 3.6σ vs 3.8σ,
+  Fisher σ(lnZ) 0.027 vs 0.029 dex) but mutes the weak mid-IR SO2 bands
+  (MIRI LRS 0.9σ vs 1.9σ) — switch to High before quoting MIRI numbers.
+- Cool columns (T ≲ 900 K, e.g. WASP-107b) converge slower: ~5 min instead of
+  ~1.5 (the GUI estimate accounts for this).
+- HITRAN line lists (main isotopologue), adequate for planning; not
+  HITEMP/ExoMol — room-T lists under-represent hot bands at ≳1000 K, so
+  absolute feature strengths lean low where hot bands matter. Broadening is
+  terrestrial air by default; `config.BROADENING="h2he"` (or the profile
+  override) switches to HITRAN planetary H2/He widths where available
+  (`validation/broadening_ab.py` measures the difference).
+- Abundance knobs are exact **elemental** directions as of v5
+  (`abundance_mode="elemental"`): lnZ and dlnCO move conserved column
+  elemental ratios exactly (H/He fixed), the column sums to P/(k_B T) per
+  layer, and the chemistry's conserved atom totals match the requested gas.
+  v4 and earlier used species-mask scalings with documented elemental leakage
+  — all cached spectra were invalidated (`_VERSION = 5`).
 - No partial-saturation strategy (pandeia group optimization only).

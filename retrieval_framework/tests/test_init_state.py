@@ -91,7 +91,7 @@ def test_init_state_rejects_nonconverged_and_keeps_target_n():
     pipe = _chem_like_pipe(count_max=100)
     # 12 draws: first 4 exhausted (>=0), last 8 healthy (<0). Ask for 8.
     U = _U([+1, +1, +1, +1, -1, -2, -3, -4, -5, -6, -7, -8])
-    U_keep, L, G, Y, refs, DY = P._init_state(pipe, U, target_n=8)
+    U_keep, L, G, Y, refs, DY, stats = P._init_state(pipe, U, target_n=8)
 
     assert U_keep.shape[0] == 8 and L.shape[0] == 8 and G.shape[0] == 8
     assert np.all(np.isfinite(np.asarray(L)))
@@ -106,7 +106,7 @@ def test_init_state_culls_extra_survivors_to_exactly_target_n():
     pipe = _chem_like_pipe(count_max=100)
     # 10 healthy draws but only 6 requested -> keep the first 6, no rejection needed
     U = _U([-1, -2, -3, -4, -5, -6, -7, -8, -9, -10])
-    U_keep, L, G, Y, refs, DY = P._init_state(pipe, U, target_n=6)
+    U_keep, L, G, Y, refs, DY, stats = P._init_state(pipe, U, target_n=6)
     assert U_keep.shape[0] == 6
     assert np.allclose(np.asarray(U_keep)[:, 0], [-1, -2, -3, -4, -5, -6])
 
@@ -122,7 +122,7 @@ def test_init_state_raises_when_too_few_survivors():
 def test_init_state_all_healthy_default_target_is_len_u():
     pipe = _chem_like_pipe(count_max=100)
     U = _U([-1, -2, -3, -4])
-    U_keep, L, G, Y, refs, DY = P._init_state(pipe, U)   # target_n=None -> len(U)
+    U_keep, L, G, Y, refs, DY, stats = P._init_state(pipe, U)   # target_n=None -> len(U)
     assert U_keep.shape[0] == 4
     assert np.all(np.isfinite(np.asarray(L)))
 
@@ -133,7 +133,7 @@ def test_init_phase2_culls_recert_failures_and_backfills():
     a = np.column_stack([-np.arange(1.0, 13.0), np.zeros(12), np.zeros(12)])
     a[2, 1] = 1.0
     a[5, 1] = 1.0
-    U_keep, L, G, Y, refs, DY = P._init_state(pipe, jnp.asarray(a), target_n=8)
+    U_keep, L, G, Y, refs, DY, stats = P._init_state(pipe, jnp.asarray(a), target_n=8)
     assert U_keep.shape[0] == 8 and L.shape[0] == 8
     # culled draws (first coords -3, -6) replaced by the next spares, order preserved
     assert np.allclose(np.asarray(U_keep)[:, 0], [-1, -2, -4, -5, -7, -8, -9, -10])

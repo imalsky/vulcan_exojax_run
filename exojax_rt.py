@@ -44,8 +44,69 @@ _H2_MOLMASS, _HE_MOLMASS = 2.016, 4.0026   # g/mol, for the Rayleigh mmr convers
 _BAR_CGS = 1.0e6
 
 
-def _build_opa(key: str, spec: dict, nu_grid):
-    """Build one premodit opacity for ``key`` (CO cached; others downloaded)."""
+def _blend_h2he_broadening(mdb, key: str) -> None:
+    """Overwrite ``mdb.gamma_air``/``n_air`` with an H2/He-weighted Lorentz width.
+
+    HITRAN's default gamma_air/n_air describe TERRESTRIAL air, which is the wrong
+    perturber for an H2/He-dominated envelope. With ``nonair_broadening=True`` exojax
+    exposes the HITRAN planetary-broadener columns (gamma_h2/n_h2, gamma_he/n_he)
+    where the database provides them; this blends them with the fixed number-fraction
+    mix ``config.H2HE_BROADENING_MIX`` and writes the result into the gamma_air/n_air
+    slots that OpaPremodit (and MDBSnapshot) consume, so the rest of the opacity
+    pipeline is untouched. Lines lacking a valid H2/He entry fall back to gamma_air
+    FOR THAT PARTNER, and the per-molecule coverage is printed loudly; a molecule
+    with NO coverage at all raises (use broadening="air" for it, knowingly).
+    The temperature exponent is the gamma-weighted mean (exact at T_ref, first-order
+    in the mix elsewhere).
+    """
+    g_air = np.asarray(mdb.gamma_air, dtype=np.float64)
+    n_air = np.asarray(mdb.n_air, dtype=np.float64)
+    f_h2, f_he = config.H2HE_BROADENING_MIX
+    parts = []
+    for partner, frac in (("h2", f_h2), ("he", f_he)):
+        g = getattr(mdb, f"gamma_{partner}", None)
+        n = getattr(mdb, f"n_{partner}", None)
+        if g is None or n is None:
+            parts.append((frac, None, None, 0.0))
+            continue
+        g = np.asarray(g, dtype=np.float64)
+        n = np.asarray(n, dtype=np.float64)
+        ok = np.isfinite(g) & (g > 0.0)
+        n_ok = np.where(np.isfinite(n), n, n_air)
+        parts.append((frac, np.where(ok, g, g_air), np.where(ok, n_ok, n_air),
+                      float(ok.mean()) if g.size else 0.0))
+    if all(p[1] is None for p in parts):
+        raise RuntimeError(
+            f"broadening='h2he' requested but HITRAN supplies no H2/He broadening "
+            f"columns for {key} in this band (or the cache predates "
+            "nonair_broadening=True -- h2he mode uses a separate '<db>_h2he' cache "
+            "dir precisely to force a fresh extended download). Either drop the "
+            f"molecule, or run it with broadening='air' knowingly.")
+    gamma_mix = np.zeros_like(g_air)
+    gn_mix = np.zeros_like(g_air)
+    for frac, g, n, _cov in parts:
+        g_eff = g_air if g is None else g
+        n_eff = n_air if n is None else n
+        gamma_mix = gamma_mix + frac * g_eff
+        gn_mix = gn_mix + frac * g_eff * n_eff
+    n_mix = gn_mix / np.where(gamma_mix > 0.0, gamma_mix, 1.0)
+    cov = {p: parts[i][3] for i, p in enumerate(("H2", "He"))}
+    print(f"[rt]   {key}: H2/He broadening blend f=({f_h2:.2f},{f_he:.2f}); line "
+          f"coverage H2 {cov['H2']:.1%}, He {cov['He']:.1%} (uncovered lines keep "
+          f"gamma_air for that partner); median gamma_mix/gamma_air = "
+          f"{np.median(gamma_mix / np.where(g_air > 0, g_air, np.nan)):.3f}", flush=True)
+    mdb.gamma_air = gamma_mix
+    mdb.n_air = n_mix
+
+
+def _build_opa(key: str, spec: dict, nu_grid, broadening: str = "air"):
+    """Build one premodit opacity for ``key`` (CO cached; others downloaded).
+
+    ``broadening``: "air" (HITRAN default, terrestrial perturber -- documented
+    approximation) or "h2he" (HITRAN planetary H2/He widths where available, blended
+    per ``config.H2HE_BROADENING_MIX``; separate ``<db>_h2he`` download cache).
+    ExoMol sources already carry their own default broadening and ignore the knob.
+    """
     src = spec["source"]
     if src in ("exomol", "exomol_cached"):
         path = spec["db"] if src == "exomol_cached" else str(config.DEMO_DATABASE / spec["db"])
@@ -53,7 +114,19 @@ def _build_opa(key: str, spec: dict, nu_grid):
     elif src == "hitran":
         # isotope=1 (main isotopologue): isotope=0 pulls minor isotopologues whose
         # TIPS partition functions are missing from hapi (e.g. SO2 (9,3) -> KeyError).
-        mdb = MdbHitran(str(config.DEMO_DATABASE / spec["db"]), nurange=nu_grid, isotope=1)
+        # HITRAN line intensities include the terrestrial isotopic abundance factor,
+        # so applying the main-isotopologue opacity to the TOTAL molecular VMR is the
+        # standard (slightly conservative) approximation documented in config.py.
+        if broadening == "h2he":
+            mdb = MdbHitran(str(config.DEMO_DATABASE / (spec["db"] + "_h2he")),
+                            nurange=nu_grid, isotope=1, nonair_broadening=True)
+            _blend_h2he_broadening(mdb, key)
+        elif broadening == "air":
+            mdb = MdbHitran(str(config.DEMO_DATABASE / spec["db"]), nurange=nu_grid,
+                            isotope=1)
+        else:
+            raise ValueError(f"unknown broadening mode {broadening!r} "
+                             "(expected 'air' or 'h2he')")
     else:
         raise ValueError(f"unknown opacity source {src!r} for {key}")
     try:
@@ -76,10 +149,12 @@ def _accumulate_dtau(art, nu_grid, mols, opas, molmass, opacia, g_btm,
     """Per-layer optical-depth matrix ``dtau`` (nlayer, n_nu) on the ART pressure grid.
 
     The sum of each molecule's line opacity plus the H2-H2 CIA continuum -- and,
-    optionally, H2-He CIA (``opacia_he`` + ``vmr_he``) and the ExoJax power-law
-    retrieval cloud (``cloud``). This is the shared core of the transmission and
-    emission models -- identical physics; the two differ only in the final
-    ``art.run`` call -- so it lives here once.
+    optionally, H2-He CIA (``opacia_he`` + ``vmr_he``), the ExoJax power-law
+    retrieval cloud (``cloud``), and H2/He Rayleigh scattering (``rayleigh_xs``).
+    Shared by the transmission and emission models: line + CIA + cloud terms are
+    identical; Rayleigh is transmission-only BY DESIGN (it is scattering, not
+    absorption -- adding it to the pure-absorption ibased emission solver would
+    fake thermal extinction; it is also negligible at the >1 um thermal bands).
 
     Parameters
     ----------
@@ -168,11 +243,16 @@ def build_rt_model(profile: dict) -> SimpleNamespace:
           f"lambda[{1e4/profile['nu_max']:.2f},{1e4/profile['nu_min']:.2f}] um", flush=True)
 
     mols = list(profile["molecules"])
+    broadening = str(profile.get("broadening", config.BROADENING))
+    print(f"[rt] pressure broadening: {broadening}"
+          + (" (terrestrial-air widths -- documented approximation; set "
+             "broadening='h2he' for HITRAN planetary H2/He widths)"
+             if broadening == "air" else ""), flush=True)
     opas, molmass = {}, {}
     for key in mols:
         spec = config.MOLECULES[key]
         tb = time.time()
-        opa, n_lines = _build_opa(key, spec, nu_grid)
+        opa, n_lines = _build_opa(key, spec, nu_grid, broadening=broadening)
         opas[key] = opa
         molmass[key] = float(spec["molmass"])
         print(f"[rt]   {key}: {n_lines} lines, opa built in {time.time()-tb:.1f}s", flush=True)
@@ -219,13 +299,24 @@ def build_rt_model(profile: dict) -> SimpleNamespace:
     g_btm = float(profile.get("gs_cgs", config.GS_CGS))
     depth_norm = (Rp_btm / float(profile.get("rstar_cm", config.RSTAR_CM))) ** 2  # (R_btm/R_star)^2
 
+    def _require_he(vmr_he):
+        # He is ~16% by number at 10x solar and its CIA is real continuum physics;
+        # an accidental None here used to SILENTLY drop the term (the sensitivity
+        # demo shipped that way). Fail loud instead -- standing repo rule.
+        if vmr_he is None:
+            raise ValueError(
+                "vmr_he is required: pass the He VMR profile (chem.sidx['He']) so the "
+                "H2-He CIA term is included. There is no supported He-less mode.")
+
     def transmission_depth(vmr, vmr_h2, T_art, mmw_art, vmr_he=None, cloud=None):
         """Transit depth (R_p(lambda)/R_star)^2 from ART-grid profiles.
 
-        vmr : dict molecule -> (nlayer,) VMR; vmr_h2 : (nlayer,) H2 VMR (for CIA).
-        Optional: vmr_he (H2-He CIA partner) and cloud=[log10 kappac0, alphac]
-        (ExoJax powerlaw_clouds). Defaults keep legacy callers byte-compatible.
+        vmr : dict molecule -> (nlayer,) VMR; vmr_h2 : (nlayer,) H2 VMR (for CIA);
+        vmr_he : (nlayer,) He VMR (H2-He CIA partner; REQUIRED -- the None default
+        exists only so an omission raises the explanatory ValueError, not TypeError).
+        Optional: cloud=[log10 kappac0, alphac] (ExoJax powerlaw_clouds).
         """
+        _require_he(vmr_he)
         dtau = _accumulate_dtau(art, nu_grid, mols, opas, molmass, opacia, g_btm,
                                 vmr, vmr_h2, T_art, mmw_art,
                                 opacia_he=opacia_he, vmr_he=vmr_he, cloud=cloud,
@@ -238,7 +329,10 @@ def build_rt_model(profile: dict) -> SimpleNamespace:
         pressure P_btm is Rp_btm * e^lnR0 (gravity held fixed -- the standard xR_p
         normalization nuisance, cf. Batalha & Line 2017). lnR0 = 0 reproduces
         transmission_depth exactly; the lnR0 jvp is the exact geometric+hydrostatic
-        response, RT-only (chemistry profiles enter frozen)."""
+        response, RT-only (chemistry profiles enter frozen). Because gravity is held
+        fixed, lnR0 must be read as a pressure-radius normalization, NOT a physical
+        planet-radius change at fixed mass."""
+        _require_he(vmr_he)
         Rp_r = Rp_btm * jnp.exp(lnR0)
         dtau = _accumulate_dtau(art, nu_grid, mols, opas, molmass, opacia, g_btm,
                                 vmr, vmr_h2, T_art, mmw_art,
@@ -254,20 +348,30 @@ def build_rt_model(profile: dict) -> SimpleNamespace:
         wl_um=1e4 / np.asarray(nu_grid),
         p_art_bar=p_art_bar,
         molecules=mols,
+        broadening=broadening,
         has_cia_h2he=opacia_he is not None,
         # internals reused by build_emis_model (so opacities aren't rebuilt)
         _nu_grid=nu_grid, _opas=opas, _molmass=molmass, _opacia=opacia,
+        _opacia_he=opacia_he,
     )
 
 
 def build_emis_model(trt, profile: dict) -> SimpleNamespace:
     """Build an ArtEmisPure thermal-emission model that SHARES trt's opacities/grid.
 
-    Returns a model whose ``emission_flux(vmr, vmr_h2, T_art, mmw_art)`` maps the same
-    ART-grid profiles to the planet's emergent flux spectrum (erg s^-1 cm^-2 / cm^-1).
+    Returns a model whose ``emission_flux(vmr, vmr_h2, T_art, mmw_art, vmr_he)`` maps
+    the same ART-grid profiles to the planet's EMERGENT flux spectrum
+    (erg s^-1 cm^-2 / cm^-1). This is the top-of-atmosphere planetary flux, NOT an
+    eclipse depth / planet-star contrast -- do not compare it to an observed
+    secondary-eclipse spectrum without dividing by the stellar flux and applying
+    (Rp/Rstar)^2. Opacity terms match transmission (lines + H2-H2 + H2-He CIA,
+    optional cloud); Rayleigh scattering is deliberately excluded here (see
+    _accumulate_dtau -- a pure-absorption solver must not count scattering as
+    thermal absorption, and it is negligible in the thermal bands).
     """
     nu_grid = trt._nu_grid
     opas, molmass, opacia, mols = trt._opas, trt._molmass, trt._opacia, trt.molecules
+    opacia_he = trt._opacia_he
     g_btm = float(profile.get("gs_cgs", config.GS_CGS))
 
     art = ArtEmisPure(nu_grid=nu_grid, pressure_top=config.ART_PTOP_BAR,
@@ -276,10 +380,18 @@ def build_emis_model(trt, profile: dict) -> SimpleNamespace:
     art.change_temperature_range(config.T_OPA_MIN_K, config.T_OPA_MAX_K)
     print(f"[rt] ArtEmisPure {profile['art_nlayer']} layers (shares opacities)", flush=True)
 
-    def emission_flux(vmr, vmr_h2, T_art, mmw_art):
-        """Emergent thermal flux (n_nu,) from ART-grid VMR/T/mmw profiles."""
+    def emission_flux(vmr, vmr_h2, T_art, mmw_art, vmr_he=None, cloud=None):
+        """Emergent thermal flux (n_nu,) from ART-grid VMR/T/mmw profiles.
+
+        vmr_he is REQUIRED (H2-He CIA -- same continuum physics as transmission;
+        the None default only upgrades the omission error message)."""
+        if vmr_he is None:
+            raise ValueError(
+                "vmr_he is required: pass the He VMR profile so the H2-He CIA term "
+                "is included in the emission opacity (parity with transmission).")
         dtau = _accumulate_dtau(art, nu_grid, mols, opas, molmass, opacia, g_btm,
-                                vmr, vmr_h2, T_art, mmw_art)
+                                vmr, vmr_h2, T_art, mmw_art,
+                                opacia_he=opacia_he, vmr_he=vmr_he, cloud=cloud)
         return art.run(dtau, T_art)
 
     return SimpleNamespace(

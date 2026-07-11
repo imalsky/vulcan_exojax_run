@@ -164,7 +164,7 @@ def calibrate(cfg: C.Config, pipe, P, jax) -> Dict[str, float]:
     U = pipe.sample_prior_u(sub, P._init_draw_count(pipe, N))
 
     t0 = time.perf_counter()
-    U, L, G, Y, refs, DY = P._init_state(pipe, U, target_n=N)
+    U, L, G, Y, refs, DY, _init_stats = P._init_state(pipe, U, target_n=N)
     jax.block_until_ready(L)
     t_init = time.perf_counter() - t0
     log.info(f"state init (cold likelihood + move-map gradient): {t_init:.1f}s "
@@ -316,7 +316,10 @@ def main() -> None:
                    param_names=np.asarray(pipe.names, dtype="<U64"),
                    param_labels=np.asarray(pipe.labels, dtype="<U64"),
                    samples=res["theta_draws"],
-                   u_particles=res["U"], final_beta=np.asarray(res["final_beta"]))
+                   u_particles=res["U"], final_beta=np.asarray(res["final_beta"]),
+                   # travels WITH the samples so no consumer can miss it: beta<1
+                   # draws are tempered, not the posterior
+                   reached_beta1=np.asarray(int(res["reached_beta1"]), np.int32))
         P.save_npz(extra_path,
                    inference_method=np.asarray(2, np.int32),
                    smc_kernel=np.asarray("mala+precond", dtype="<U16"),
@@ -328,6 +331,16 @@ def main() -> None:
                    smc_step_size_history=res["step_size_history"],
                    smc_unique_particles=res["unique_particles"],
                    smc_scale_diag_final=res["scale_diag_final"],
+                   smc_warm_capped=res["warm_capped"],
+                   # evidence conditioning: smc_logZ is under the OPERATIONAL prior
+                   # (T-P window x converged support, renormalized); the measured
+                   # support fraction + the box-prior value ride along -- quote them
+                   # together (see run_smc_loop docstring)
+                   smc_log_support_fraction=np.asarray(res["log_support_fraction"]),
+                   smc_log_support_fraction_err=np.asarray(res["log_support_fraction_err"]),
+                   smc_logZ_box=np.asarray(res["logZ_box"]),
+                   init_stats_keys=np.asarray(list(res["init_stats"].keys()), dtype="<U32"),
+                   init_stats_vals=np.asarray(list(res["init_stats"].values()), np.int64),
                    reached_beta1=np.asarray(int(res["reached_beta1"]), np.int32),
                    inferred_param_names=np.asarray(pipe.names, dtype="<U64"),
                    inferred_param_truth=output_truth(cfg, pipe))
@@ -335,8 +348,10 @@ def main() -> None:
 
         theta = res["theta_draws"].reshape(-1, pipe.n_dim)
         truth = output_truth(cfg, pipe)
-        log.info("Posterior (median [5%,95%]):" if not cfg.generate_synthetic_data
-                 else "Recovery (median [5%,95%], truth):")
+        tag = "" if res["reached_beta1"] else \
+            f" [TEMPERED beta={res['final_beta']:.3f} -- NOT the posterior]"
+        log.info(("Posterior (median [5%,95%]):" if not cfg.generate_synthetic_data
+                 else "Recovery (median [5%,95%], truth):") + tag)
         for i, name in enumerate(pipe.names):
             q = np.percentile(theta[:, i], [5, 50, 95])
             msg = f"  {name:16s} {q[1]:9.3f} [{q[0]:9.3f},{q[2]:9.3f}]"
@@ -354,6 +369,10 @@ def main() -> None:
         log.info("Posterior predictive...")
         import jax.numpy as jnp
         s = np.load(samples_path)
+        if "reached_beta1" in s.files and not bool(int(s["reached_beta1"])):
+            log.warning(f"PPC input samples are TEMPERED (final beta="
+                        f"{float(s['final_beta']):.3f} < 1): the predictive band is "
+                        "under the tempered measure, not the posterior predictive.")
         theta_all = np.asarray(s["samples"]).reshape(-1, pipe.n_dim)
         rng = np.random.default_rng(cfg.seed + 1)
         n_take = min(int(cfg.ppc_draws), theta_all.shape[0])

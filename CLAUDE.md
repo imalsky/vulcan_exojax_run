@@ -3,6 +3,34 @@
 Critical rules and decisions for this bundle. Read before touching the retrieval or
 running anything on the supercomputer.
 
+## 2026-07-11 scientific-correctness pass — EVERY cache/checkpoint is stale
+
+Audit-response changes (README "Scientific-correctness pass" + module docstrings):
+exact-elemental abundance map (`abundance_mode="elemental"`, schema default — lnZ/c_o
+are now exact conserved-ratio directions, atom_ini exact, Σn=P/kT at init), per-proposal
+atmosphere rebuild (Dzz(T,M)/vm/vs + pv.Kzz + initial carry geometry; conden refuses
+T-varying builds), H2-He CIA REQUIRED in every RT call (vmr_he is a required arg),
+broadening knob ("air"/"h2he"), evidence reported as OPERATIONAL-prior conditioned with
+measured support fraction (`logZ_box = logZ + ln f` in results/npz; init cull counts
+persisted through checkpoints), per-sweep/stage `warmcap=` counters, tempered-draw
+labels on every output path, validate_warm gates on logL + spectrum-ppm + inventories,
+jwst_tool v5 (floor-aware transits, R=100-anchored floors, offset-marginalized detect,
+saturation-consistent Fisher; `_VERSION=5`). Bundle is pip-installable
+(`pip install -e .`, console script `jwst-tool`).
+
+Operational consequences:
+- **The chemistry map changed** (elemental + atm rebuild): synthetic obs, demo npz
+  caches (`data/*.npz`), zco/Fisher caches, jwst_tool model_cache, and ALL SMC
+  checkpoints are STALE. Regenerate; do NOT resume a pre-pass checkpoint into the new
+  map (likelihoods re-anchor mid-run). `overwrite=True` handles synthetic obs.
+- **Before the next production run**: `PROBE_MEMORY=1` (the evaluator gained small
+  per-proposal structure rebuilds), then the smoke chain + suite, then on the GPU node
+  the new validation set: `validation/elemental_audit.py`,
+  `resolution_ladder.py`, `top_pressure_ladder.py --extend-chem`,
+  `broadening_ab.py`, and post-run `validate_warm` + `mala_reversibility.py`.
+- **`h2he` broadening** downloads separate `<db>_h2he` line-list caches on first use
+  (network / NAS proxy); default stays "air" until broadening_ab.py is run and judged.
+
 ## Supercomputer sync — git pull for CODE (preferred, 2026-07-10), scp for DATA
 
 **Code updates: `git pull` on the NAS front end** (both repos are public on GitHub and

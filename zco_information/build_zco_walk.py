@@ -72,13 +72,15 @@ def main():
     to_art = interp_map.make_to_art(chem.p_bar, trt.p_art_bar)
     mol_cols = {k: chem.sidx[config.MOLECULES[k]["vulcan"]] for k in trt.molecules}
     h2 = chem.sidx[config.BULK_H2_VULCAN]
+    he = chem.sidx["He"]        # H2-He CIA partner (required by the RT)
     T_base = jnp.asarray(chem.T_base); masses = chem.species_masses
 
     def depth_of(theta):
         ymix = chem.converged_ymix(jnp.asarray(theta, dtype=jnp.float64))
         T_art = to_art(T_base + theta[3]); mmw_art = to_art(ymix @ masses)
         vmr = {k: to_art(ymix[:, c]) for k, c in mol_cols.items()}
-        return np.asarray(trt.transmission_depth(vmr, to_art(ymix[:, h2]), T_art, mmw_art))
+        return np.asarray(trt.transmission_depth(vmr, to_art(ymix[:, h2]), T_art,
+                                                 mmw_art, vmr_he=to_art(ymix[:, he])))
 
     wl_m = np.asarray(trt.wl_um)
     depth0 = depth_of(config.THETA0)

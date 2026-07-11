@@ -7,13 +7,13 @@ spectrum (Zenodo 10161743, Fixed_LimbDarkening products) for the per-bin error b
 
 The parameter vector for the reported figures is
 
-    theta = [ lnZ, dln(C/O), lnKzz, T_int,  lnR0,  offset_1 .. offset_{G-1} ]
+    theta = [ lnZ, dln(C/O), lnKzz, dT,  lnR0,  offset_1 .. offset_{G-1} ]
             |------ chemistry (4) ------|  radius  inter-instrument offsets (G-1 groups)
 
     * lnZ       natural-log metallicity scale (scales C/N/O/S element totals)
     * dln(C/O)  log carbon-to-oxygen ratio at FIXED oxygen (fixed-O knob in vulcan_chem)
     * lnKzz     eddy diffusion scale
-    * T_int     uniform temperature shift (K)
+    * dT        uniform temperature shift (K; historically mislabeled T_int)
     * lnR0      reference-radius scaling at the bottom pressure (the standard xR_p
                 transmission normalization nuisance; Batalha & Line 2017)
     * offset_g  a flat depth offset (ppm) for instrument group g, relative to the
@@ -23,7 +23,7 @@ The parameter vector for the reported figures is
 
 We build the full Fisher F = J^T diag(1/sigma^2) J, invert it, and REPORT the
 (lnZ, dlnCO) 2x2 sub-block of C = F^-1 -- i.e. everything else is MARGINALIZED, not
-fixed. Marginalizing (not fixing) Kzz/T_int/R0/offsets is what makes the error bars
+fixed. Marginalizing (not fixing) Kzz/dT/R0/offsets is what makes the error bars
 honest; see docs.
 
 NOT modeled (documented as a toy limitation, per Isaac's scope decision): clouds/hazes,
@@ -56,8 +56,8 @@ WL_LO, WL_HI = 1.00, 5.28
 BANDS = {"H2O": 2.70, "CH4": 3.30, "SO2": 4.05, "CO2": 4.30, "CO": 4.66}
 
 # Chemistry parameter labels (columns 0..3 of the cached J).
-CHEM_LABELS = [r"$\ln Z$", r"$\ln(\mathrm{C/O})$", r"$\ln K_{zz}$", r"$T_{\rm int}$"]
-CHEM_KEYS = ["lnZ", "lnCO", "lnKzz", "T_int"]
+CHEM_LABELS = [r"$\ln Z$", r"$\ln(\mathrm{C/O})$", r"$\ln K_{zz}$", r"$\Delta T$"]
+CHEM_KEYS = ["lnZ", "lnCO", "lnKzz", "dT"]
 
 # Carter & May (2024) Fixed-limb-darkening recommended products. Each entry:
 #   (instrument_group, csv_filename). NRS1/NRS2 share the G395H group (one offset).
@@ -124,7 +124,7 @@ def load_combined(combo=DEFAULT_COMBO, wl_lo=WL_LO, wl_hi=WL_HI):
 def load_jacobians(npz=DATA / "zco_jacobians.npz"):
     """Load the per-tier cached Jacobians. Returns (wl_um, dict(tier -> payload)).
 
-    Each payload: depth (n,), J_chem (n,4) [lnZ,lnCO,lnKzz,T_int], J_lnR0 (n,).
+    Each payload: depth (n,), J_chem (n,4) [lnZ,lnCO,lnKzz,dT], J_lnR0 (n,).
     """
     d = np.load(npz, allow_pickle=True)
     wl = np.asarray(d["wl_um"], float)
@@ -174,7 +174,7 @@ OFFSET_UNIT = 1.0e-6   # offset parameter is in ppm: d(depth)/d(offset_ppm) = 1e
 def build_design(tier_payload, wl_model, obs, use_lnR0=True, use_offsets=True):
     """Assemble the binned design matrix J_full and per-bin sigma for one tier.
 
-    Columns: [lnZ, lnCO, lnKzz, T_int] (chemistry) + [lnR0] + [offset_g for g in
+    Columns: [lnZ, lnCO, lnKzz, dT] (chemistry) + [lnR0] + [offset_g for g in
     groups[1:]] (relative to the reference group groups[0]).
 
     Returns dict(J, sigma, labels, keys, interest=(0,1), wl, group, depthM).

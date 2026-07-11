@@ -3,17 +3,17 @@ transmission-spectrum Jacobian and REAL JWST error bars.
 
 The demo (vulcan_exojax_run/) produces J = d(transit depth)/d(theta) at every
 wavelength by forward-mode AD straight through the chemistry and the radiative
-transfer. The cache contains theta = [lnZ, carbon proxy, lnKzz, T_int]. We REPORT the
-two abundance directions (lnZ, carbon) but MARGINALIZE over lnKzz and T_int:
+transfer. The cache contains theta = [lnZ, carbon proxy, lnKzz, dT]. We REPORT the
+two abundance directions (lnZ, carbon) but MARGINALIZE over lnKzz and dT:
 
     F = J^T diag(1/sigma^2) J            (the full 4x4 Fisher)
     C = F^-1                             (4x4 covariance)
-    report the (lnZ, carbon) 2x2 sub-block of C   -> Kzz, T_int marginalized
+    report the (lnZ, carbon) 2x2 sub-block of C   -> Kzz, dT marginalized
 
 From that, with no sampling and no retrieval: marginal error bars (sqrt of the sub-block
 diagonal); the metallicity/carbon degeneracy; which wavelengths UNIQUELY constrain each
 parameter (per-bin info with the other parameters projected out); and an instrument
-comparison. Marginalizing Kzz/T_int (vs holding them fixed) inflates sigma(log Z) ~2.8x.
+comparison. Marginalizing Kzz/dT (vs holding them fixed) inflates sigma(log Z) ~2.8x.
 
 REALISM: the default noise is the ACTUAL achieved JWST error bars on WASP-39b --
 the Rustamkulov et al. (2023) NIRSpec PRISM spectrum (FIREFLy reduction, Zenodo
@@ -43,6 +43,7 @@ Reads cached Jacobians + the real spectrum read-only; touches no VULCAN-JAX libr
 from __future__ import annotations
 
 import sys
+import os
 from pathlib import Path
 
 import numpy as np
@@ -50,7 +51,8 @@ import numpy as np
 # np.trapz was renamed np.trapezoid in NumPy 2.0 (and trapz removed); support both.
 _trapezoid = getattr(np, "trapezoid", None) or np.trapz
 
-ROOT = Path("/Users/imalsky/Desktop/Emulators/VULCAN_Project")
+ROOT = Path(os.environ.get("VULCAN_PROJECT_ROOT",
+                            "/Users/imalsky/Desktop/Emulators/VULCAN_Project"))
 RUN = ROOT / "vulcan_exojax_run"
 DEMO_OUT = RUN / "data"   # exojax demo npz consolidated into the run bundle
 DATA = RUN / "data"
@@ -64,7 +66,7 @@ from noise_model import (INSTRUMENTS, constant_R_grid,                         #
 
 BANDS = {"H2O": 2.70, "CH4": 3.30, "SO2": 4.00, "CO2": 4.30, "CO": 4.66}
 INTEREST = (0, 1)          # lnZ, carbon enrichment -- the science directions we report
-NUISANCE = (2, 3)          # lnKzz, T_int -- MARGINALIZED (audit issue #2), not held fixed
+NUISANCE = (2, 3)          # lnKzz, dT -- MARGINALIZED (audit issue #2), not held fixed
 THETA_TEX = [r"$\ln Z$", "carbon enrichment"]
 THETA_NAMES = ["lnZ", "carbon_enrichment"]
 # The Jacobian over the full PRISM reach (1-15 um file, clipped to PRISM 1-5.3 um);
@@ -77,7 +79,7 @@ PRISM_LO, PRISM_HI = 1.0, 5.35
 # --------------------------------------------------------------------------- #
 def load_jacobian(npz, jkey="J"):
     """Return (wl_um, depth, J (n,4), labels) with ALL theta columns
-    [lnZ, carbon, lnKzz, T_int]. Kzz/T_int are kept so they can be MARGINALIZED, not fixed."""
+    [lnZ, carbon, lnKzz, dT]. Kzz/dT are kept so they can be MARGINALIZED, not fixed."""
     d = np.load(npz, allow_pickle=True)
     labels = ([str(x) for x in d["theta_labels"]] if "theta_labels" in d.files
               else ["lnZ", "carbon_proxy", "lnKzz", "T_int"])

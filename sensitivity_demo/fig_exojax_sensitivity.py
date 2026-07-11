@@ -36,7 +36,7 @@ from _common import FIGS, apply_style, require_input   # FIGS = jax_paper/figure
 DATA = _HERE.parent / "data"                           # run-bundle npz caches (vulcan_exojax_run/data)
 NPZ = DATA / "wide_sensitivity.npz"
 OUT = FIGS / "exojax_sensitivity.png"
-PARAM_COL = 0                                   # theta order is [lnZ, C/O, lnKzz, T_int]
+PARAM_COL = 0                                   # theta order is [lnZ, C/O, lnKzz, dT]
 WL_LO, WL_HI, R = 1.0, 5.5, 100                 # NIRSpec PRISM range (1 um CIA floor) + resolution
 
 

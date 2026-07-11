@@ -2,7 +2,7 @@
 
 Builds the full chain (live VULCAN-JAX chemistry -> ExoJax ArtTransPure), evaluates the
 transit spectrum at the baseline, and pushes one forward-mode tangent per physical
-parameter (ln Z, C/O, ln Kzz, T_int) all the way to data space. Renders a 2x2 figure
+parameter (ln Z, C/O, ln Kzz, dT -- a uniform T offset) all the way to data space. Renders a 2x2 figure
 where every spectrum point is colored by d(transit_depth)/d(parameter): the colored
 regions are exactly the wavelengths that best constrain that parameter -- a quantitative
 observation-planning view.
@@ -82,7 +82,7 @@ def make_figure(wl_um, depth, J, molecules, out_png):
     titles = [r"$\partial d / \partial \ln Z$",
               r"$\partial d / \partial (\mathrm{C/O})$",
               r"$\partial d / \partial \ln K_{zz}$",
-              r"$\partial d / \partial T_{\rm int}$"]
+              r"$\partial d / \partial (\Delta T)$"]
     fig, axes = plt.subplots(2, 2, figsize=(12.8, 8.4), sharex=True, sharey=True)
     pad = 0.04 * (d_ppm.max() - d_ppm.min())
     for k, ax in enumerate(axes.flat):

@@ -72,8 +72,23 @@ class Config:
     nu_pts: int = 1652
     art_nlayer: int = 60
     use_rayleigh: bool = True          # H2/He Rayleigh scattering (ExoJax; zero free params)
-    co_mode: str = "fixed_O"           # the true fixed-oxygen C/O knob
-    reanchor_atom_ini: bool = True     # rebuild conserved atom totals for finite lnZ/C-O steps
+    co_mode: str = "fixed_O"           # C/O GUESS construction (elemental mode repairs it exactly)
+    # Abundance-knob semantics. "elemental" (production default) makes lnZ / c_o EXACT
+    # column elemental directions: after the mask-scaled guess the column is renormalized
+    # to sum_i n_i = P/(kB T) per layer and linearly repaired on the runner's reservoir
+    # species so the column ratios hit He/H = base, {O,N,S}/H = Z x base,
+    # C/H = Z e^{c_o} x base exactly, and pv.atom_ini is rebuilt from that column --
+    # conserved inventories are then path-independent (cold == warm by construction).
+    # "masks" reproduces the legacy species-mask knob (published demo caches), whose
+    # elemental leakage (~0.6%/e-fold of Z into H, N/S leakage via the fixed-O b_z)
+    # and sum(n) != M init are documented in vulcan_chem. See chem.audit_init.
+    abundance_mode: str = "elemental"
+    reanchor_atom_ini: bool = True     # masks-mode only (elemental always re-anchors exactly)
+    # Pressure-broadening perturber for HITRAN opacities: "air" (terrestrial widths,
+    # the documented default approximation) or "h2he" (HITRAN planetary H2/He widths
+    # where available, blended per config.H2HE_BROADENING_MIX; per-molecule coverage
+    # printed at build; run validation/broadening_ab.py for the measured A/B).
+    broadening: str = "air"
     # Two-stage solve (REQUIRED for a live lnZ/C-O response when the T-P is retrieved):
     # stage 1 converges the column at (T(theta), Kzz(theta)) with BASELINE composition;
     # stage 2 applies the lnZ/C-O scaling to that converged column and re-converges warm.
@@ -347,6 +362,8 @@ class Config:
             art_nlayer=int(self.art_nlayer),
             use_rayleigh=bool(self.use_rayleigh),
             co_mode=str(self.co_mode),
+            abundance_mode=str(self.abundance_mode),
+            broadening=str(self.broadening),
             reanchor_atom_ini=bool(self.reanchor_atom_ini),
             fastchem_met_scale=float(self.fastchem_met_scale),
             cfg_overrides=dict(self.cfg_overrides),
@@ -479,6 +496,11 @@ def validate_config(cfg: Config) -> None:
                          "to seed on the cold map")
     if cfg.tp_model not in ("guillot", "powerlaw"):
         raise ValueError(f"unknown tp_model {cfg.tp_model!r}")
+    if str(cfg.abundance_mode) not in ("elemental", "masks"):
+        raise ValueError(f"unknown abundance_mode {cfg.abundance_mode!r} "
+                         "(expected 'elemental' or 'masks')")
+    if str(cfg.broadening) not in ("air", "h2he"):
+        raise ValueError(f"unknown broadening {cfg.broadening!r} (expected 'air' or 'h2he')")
     # Planet identity must be declared explicitly by the case: without these the RT
     # would silently normalize with the shared-lib WASP-39b radius/gravity and the
     # chemistry would run WASP-39b's baseline column -- a silently-wrong retrieval of

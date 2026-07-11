@@ -7,23 +7,36 @@ pandeia_data-3.0rc3) plus display metadata and a default systematic noise floor.
 Noise floors: pre-flight planning convention (Greene et al. 2016 assumed
 20/30/50 ppm for NIRISS/NIRCam/MIRI); in-flight results are often better
 (e.g. Schlawin et al. 2021 find ~<10 ppm for NIRCam grism), so the defaults
-here sit between the two and every floor is editable in the GUI.
+here sit between the two and every floor is editable in the GUI. Floors are
+per-bin values AT R=100 (noise.FLOOR_REF_R): the noise model scales the per-bin
+floor as sqrt(R_bin/100) for finer bins so binning choices cannot manufacture
+floor-limited significance.
 """
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 TOOL_DIR = Path(__file__).resolve().parent
 BUNDLE_DIR = TOOL_DIR.parent                      # vulcan_exojax_run/
-DATA_DIR = BUNDLE_DIR / "data" / "jwst_tool"
+# JWST_TOOL_DATA_DIR overrides the cache/CDBS root for non-editable installs
+# (default: the bundle's data/jwst_tool/, correct for the editable install).
+DATA_DIR = Path(os.environ.get("JWST_TOOL_DATA_DIR",
+                               str(BUNDLE_DIR / "data" / "jwst_tool")))
 MODEL_CACHE = DATA_DIR / "model_cache"
 NOISE_CACHE = DATA_DIR / "noise_cache"
 
 # Pandeia backend environment (the real STScI ETC engine, same as PandExo's core).
 # pandeia.engine 2026.1 in the base env rejects the on-disk 3.0rc3 refdata, so the
-# worker runs in picaso_base (pandeia 3.0), which matches it.
-PICASO_PYTHON = "/opt/homebrew/Caskroom/miniforge/base/envs/picaso_base/bin/python"
-PANDEIA_REFDATA = "/Users/imalsky/Documents/Important_Docs/JWST_CYCLE5/picaso_ian/data/pandeia_data-3.0rc3"
+# worker runs in picaso_base (pandeia 3.0), which matches it. Both paths are
+# machine-specific; override via env vars on any other machine / install
+# (noise.run_pandeia refuses loudly if the python is missing).
+PICASO_PYTHON = os.environ.get(
+    "JWST_TOOL_PANDEIA_PYTHON",
+    "/opt/homebrew/Caskroom/miniforge/base/envs/picaso_base/bin/python")
+PANDEIA_REFDATA = os.environ.get(
+    "JWST_TOOL_PANDEIA_REFDATA",
+    "/Users/imalsky/Documents/Important_Docs/JWST_CYCLE5/picaso_ian/data/pandeia_data-3.0rc3")
 # Minimal synphot CDBS assembled for this tool: phoenix grid symlinked from
 # RT-Project/picaso, johnson_j bandpass fetched from ssb.stsci.edu/trds.
 PYSYN_CDBS = str(DATA_DIR / "cdbs")
@@ -103,6 +116,8 @@ MODES = {
 
 MODE_COLOR = {key: _COLORS[i % len(_COLORS)] for i, key in enumerate(MODES)}
 
-# WASP-39 system defaults (the planet the VULCAN-JAX baseline is baked for).
-STAR_W39 = dict(teff=5400.0, log_g=4.5, metallicity=0.0, ks_mag=10.20)
-TRANSIT_T14_HR = 2.80
+# GUI default selection: blue-to-red coverage with the three workhorses.
+# (The ETC always computes ALL modes per star, so changing the selection is free.)
+DEFAULT_MODES = ["niriss_soss", "nirspec_g395h", "miri_lrs"]
+
+# Per-planet system defaults (star, geometry, T14, UV spectrum) live in planets.py.

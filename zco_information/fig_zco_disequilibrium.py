@@ -3,7 +3,7 @@
 Same radiative transfer, same real Carter & May (2024) errors; the only thing that changes
 is which chemistry physics is switched on when VULCAN-JAX converges the column:
 
-    E  equilibrium              (no photochemistry, no vertical transport)
+    E  no-transport (~equilibrium: kinetic fixed point, ~3% element drift caveat)
     Q  + transport (quenching)  (no photochemistry)
     P  + photochemistry         (the fiducial WASP-39b model)
 
@@ -30,7 +30,7 @@ import zco_lib as Z
 
 LN10 = np.log(10.0)
 TIER_STYLE = {
-    "E": dict(color="#9aa0a6", label="equilibrium"),
+    "E": dict(color="#9aa0a6", label="no-transport (~equilibrium)"),
     "Q": dict(color="#e08214", label="+ transport (quench)"),
     "P": dict(color="#cc3311", label="+ photochemistry"),
 }

@@ -60,7 +60,7 @@ def extrap():
     Y0, refs0 = P._blank_state(pipe, 1)
     L_c, Y_cold, refs_cold = jax.jit(pipe.batch_eval_cold_l)(U0, Y0, refs0)
     assert float(L_c[0]) > -1.0e29, "box-center draw failed to cold-converge"
-    L0, G0, _, _, n_bad, DY = jax.jit(pipe.batch_eval_move_vg)(U0, Y_cold, refs_cold)
+    L0, G0, _, _, n_bad, DY, _ncap = jax.jit(pipe.batch_eval_move_vg)(U0, Y_cold, refs_cold)
     assert int(n_bad) == 0
     return dict(pipe=pipe, U0=U0, Y=Y_cold, refs=refs_cold, DY=DY,
                 L0=L0, G0=G0)

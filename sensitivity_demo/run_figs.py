@@ -121,6 +121,7 @@ def main() -> int:
     to_art = interp_map.make_to_art(chem.p_bar, trt.p_art_bar)
     mol_cols = {k: chem.sidx[config.MOLECULES[k]["vulcan"]] for k in trt.molecules}
     h2 = chem.sidx[config.BULK_H2_VULCAN]
+    he = chem.sidx["He"]            # H2-He CIA partner (required by both RTs now)
     T_base = jnp.asarray(chem.T_base); masses = chem.species_masses
 
     def g(theta):
@@ -129,7 +130,8 @@ def main() -> int:
         mmw_art = to_art(ymix @ masses)
         vmr = {k: to_art(ymix[:, c]) for k, c in mol_cols.items()}
         vmr_h2 = to_art(ymix[:, h2])
-        return (vmr, vmr_h2, T_art, mmw_art)
+        vmr_he = to_art(ymix[:, he])
+        return (vmr, vmr_h2, T_art, mmw_art, vmr_he)
 
     def trans_of(gg):
         return trt.transmission_depth(*gg)

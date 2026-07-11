@@ -2,7 +2,7 @@
 
     forward(theta) = transmission_depth( bridge( converged_ymix(theta), T(theta) ) )
 
-theta = [lnZ, c_o, lnKzz, T_int]. The returned ``forward`` is one pure-JAX function
+theta = [lnZ, c_o, lnKzz, dT] (dT = uniform T offset). The returned ``forward`` is one pure-JAX function
 through which ``jax.jvp`` / ``jax.jacfwd`` push forward-mode tangents end-to-end -- from
 the physics parameters all the way to ``(R_p(lambda)/R_star)^2``.
 
@@ -35,6 +35,7 @@ def build_forward(profile: dict) -> SimpleNamespace:
 
     mol_cols = {key: chem.sidx[config.MOLECULES[key]["vulcan"]] for key in rt.molecules}
     h2_col = chem.sidx[config.BULK_H2_VULCAN]
+    he_col = chem.sidx["He"]        # H2-He CIA partner (He is inert in the network)
     T_base_j = jnp.asarray(chem.T_base)
     species_masses = chem.species_masses
 
@@ -47,7 +48,10 @@ def build_forward(profile: dict) -> SimpleNamespace:
         mmw_art = to_art(mmw_v)
         vmr = {key: to_art(ymix[:, col]) for key, col in mol_cols.items()}
         vmr_h2 = to_art(ymix[:, h2_col])
-        return rt.transmission_depth(vmr, vmr_h2, T_art, mmw_art)
+        # He CIA was silently omitted before 2026-07-10 (vmr_he defaulted to None);
+        # the RT now REQUIRES it -- regenerate sensitivity.npz/wide_sensitivity.npz
+        vmr_he = to_art(ymix[:, he_col])
+        return rt.transmission_depth(vmr, vmr_h2, T_art, mmw_art, vmr_he=vmr_he)
 
     return SimpleNamespace(forward=forward, chem=chem, rt=rt,
                            mol_cols=mol_cols, h2_col=h2_col)

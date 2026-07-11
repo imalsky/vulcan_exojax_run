@@ -99,7 +99,7 @@ def main(out=Z.FIGS / "zco_geometry.png", combo=Z.DEFAULT_COMBO, tier="P"):
         axB.set_title("(b) is the ellipse trustworthy? (validity walk)", fontsize=12.5)
         axB.legend(fontsize=8.6, loc="upper left")
         # the skew is the science: SO2 ~ Z^3.3 makes high Z easier to rule out than low Z
-        axB.annotate("high $Z$: SO$_2\\propto Z^{3.3}$ rises steeply\n$\\to$ better constrained than Gaussian",
+        axB.annotate("high $Z$: SO$_2$ rises steeply with $Z$\n$\\to$ better constrained than Gaussian",
                      xy=(2.0, 5.44), xytext=(0.15, 0.62), textcoords="axes fraction",
                      fontsize=8.0, color="#8a1a0d", ha="left",
                      arrowprops=dict(arrowstyle="->", color="#8a1a0d", lw=0.9))

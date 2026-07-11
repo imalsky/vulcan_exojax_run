@@ -42,9 +42,19 @@ The two dependencies this code chains are handled differently, on purpose:
 ```
 git clone https://github.com/imalsky/vulcan_exojax_run
 cd vulcan_exojax_run
-pip install -r requirements.txt
+pip install -e .                                   # editable install (pyproject.toml)
+pip install -e '.[gui]'                            # + Streamlit for the jwst-tool GUI
 python -m pytest retrieval_framework/tests -q     # sampler-core unit tests (fast)
+jwst-tool                                          # console script: launches the GUI
 ```
+
+The editable install exposes the shared library (`config`, `vulcan_chem`,
+`exojax_rt`, `interp_map`) plus the `retrieval_framework` and `jwst_tool` packages,
+and registers the `jwst-tool` console script. `pip install -r requirements.txt`
+still works for a dependencies-only setup. A non-editable (site-packages) install
+runs too, but must point `VULCAN_PROJECT_ROOT` at the project tree and
+`JWST_TOOL_DATA_DIR` at a writable cache directory (the code expects the
+repository's `data/` layout otherwise).
 
 (The repo keeps the directory name the HPC scripts expect; cloning it next to a
 VULCAN-JAX checkout reproduces the sibling-tree layout below unchanged.)
@@ -83,25 +93,101 @@ putting this directory on `sys.path`:
   stays frozen/off-graph. The runner forgets the initial speciation except through the
   conserved *elemental column totals*, so metallicity and C/O are expressed as
   initial-abundance (y₀) directions on those totals.
-- **Fixed-oxygen C/O knob** (`co_mode="fixed_O"`): C/O is changed by scaling C-bearing
-  species and compensating the O-only carriers so each layer's O total is invariant —
-  an exact, layer-by-layer C/O change, valid while the compensation factor stays
-  positive (a bound printed at build; the retrieval prior is capped below it).
+- **Exact-elemental abundance knobs** (`abundance_mode="elemental"`, the production /
+  retrieval / jwst_tool default since 2026-07-11): after the mask-scaled guess, the
+  column is renormalized to Σᵢnᵢ = P/(k_BT) per layer and linearly repaired on the
+  runner's own reservoir species (He/H₂O/CO/N₂/H₂S) so the column elemental ratios hit
+  He/H = base, {O,N,S}/H = Z×base, C/H = Z·e^{c_o}×base **exactly**, and the conserved
+  atom anchor `pv.atom_ini` is rebuilt from that column. Cold and warm continuation
+  therefore share identical conserved inventories by construction. The legacy
+  `"masks"` mode (published demo caches) is kept, with its elemental leakage (~0.6%
+  of H per e-fold of Z; N/S leakage through the fixed-O compensation) documented in
+  `vulcan_chem.py`. `chem.audit_init(theta)` and `validation/elemental_audit.py`
+  verify the construction per draw.
+- **Fixed-oxygen C/O guess** (`co_mode="fixed_O"`): the smooth initial guess scales
+  C-bearing species and compensates O-only carriers so each layer's O total is
+  invariant, valid while the compensation factor stays positive (a bound printed at
+  build; the retrieval prior is capped below it). In elemental mode the projection
+  makes the result exact regardless.
+- **Atmospheric structure follows the proposed T-P/composition.** The runner refreshes
+  the hydrostatic geometry (µ, g, H_p, dz, dzi, Hpi) in-loop from the live composition
+  and the proposal's T every `update_frq` accepted steps (first firing at step 1);
+  since 2026-07-11 the molecular-diffusion coefficients D_zz(T, M) (+ vm/vs where
+  enabled), the convergence gate's Kzz, and the initial carry geometry are also
+  rebuilt per proposal via the on-graph builders. The one remaining baseline-T bake is
+  the photolysis cross-section T-interpolation (host-side upstream step; second-order)
+  — and condensation, which refuses a T-varying build loudly.
 - **Opacities**: CO from cached ExoMol Li2015; H₂O/CO₂/CH₄/SO₂/HCN/C₂H₂/H₂S from HITRAN
-  **main isotopologue at the 296 K reference**. HITRAN's 296 K reference under-represents
-  the hottest bands of a ~1100 K atmosphere vs HITEMP/ExoMol; adequate for the
-  methodology (the *pattern* of sensitivity, not absolute line fidelity, is the point).
-  The premodit table is baked for **T ∈ [300, 3000] K** — profiles outside it are not
-  modelable (see the retrieval's reject-don't-clip rule).
-- **ART pressure grid** spans **1×10⁻⁸ – 7 bar**. The top is set *below* VULCAN's 1×10⁻⁷
-  bar chemistry top on purpose: without it the strong bands (CO₂ 4.3, CO 4.7 µm) go
-  optically thick to the model top and the transit radius saturates into a flat wall at
-  4.2–5.2 µm; extending to 1×10⁻⁸ bar removes it (constant-abundance + isothermal
-  upper-atmosphere extension, standard transmission practice).
+  **main isotopologue at the 296 K reference** (intensities carry the terrestrial
+  isotopic abundance factor — pairing with total molecular VMR is the standard,
+  slightly conservative treatment). HITRAN under-represents hot bands at the retrieved
+  ~770–1540 K limb vs HITEMP/ExoMol — a known accuracy limit for real-data inference,
+  swap sources per molecule in `config.MOLECULES` when the big downloads are
+  acceptable. Pressure broadening defaults to **terrestrial air**; set
+  `config.BROADENING="h2he"` (or the per-run profile key) for HITRAN's planetary H₂/He
+  widths where available, and measure the difference with
+  `validation/broadening_ab.py`. H₂-He CIA is REQUIRED physics: every depth/flux call
+  takes the He profile explicitly and raises if it is missing (a silent omission
+  biased the pre-2026-07-11 sensitivity-demo caches). The premodit table is baked for
+  **T ∈ [300, 3000] K** — profiles outside it are not modelable (see the retrieval's
+  reject-don't-clip rule).
+- **ART pressure grid** spans **1×10⁻⁸ – 7 bar**. The top sits one decade *above*
+  VULCAN's 1×10⁻⁷ bar chemistry top on purpose: the interpolation CLAMPS the topmost
+  chemistry values over that decade (constant-abundance + isothermal extension, a
+  common transmission convention — not chemistry). Without it the strong bands (CO₂
+  4.3, CO 4.7 µm) saturate into a flat wall. This is an explicit, logged modeling
+  choice; `validation/top_pressure_ladder.py` measures it against chemistry actually
+  solved to 1×10⁻⁸ bar.
 - **T-P is ExoJax's own Guillot** (`atmprof_Guillot`, a plain `jnp.exp`, forward-mode
   clean — it bypasses the Heng+14 exponential-integral pathology in VULCAN's own
-  `build_atm`). The same T(P) drives both the chemistry (VULCAN grid) and the RT (ART
-  grid), so one self-consistent profile.
+  `build_atm`). The same analytic T(P) drives both the chemistry (VULCAN grid) and the
+  RT (ART grid); the precise scope of that consistency (and the f=1/4 shape-parameter
+  caveat) is documented in `retrieval_framework/tp_profile.py`.
+- **Native spectral resolution** defaults to nu_pts=1652 (R~1000 over the production
+  band) — a GPU-gradient-memory bound, not a demonstrated convergence point.
+  `validation/resolution_ladder.py` is the convergence test (binned depths + Jacobian
+  columns vs a nu_pts ladder, optional LSF); run it before quoting few-ppm numbers.
+
+---
+
+## Scientific-correctness pass (2026-07-11, external-audit response)
+
+An external scientific audit of this bundle was answered in full; the load-bearing
+changes (details in each module's docstring):
+
+1. **Abundance knobs are exact elemental directions** (`abundance_mode="elemental"`,
+   default for retrieval + jwst_tool): exact conserved ratios, Σn=P/k_BT, exact
+   `atom_ini`, path-independent inventories. Legacy `"masks"` kept for the published
+   demo caches.
+2. **Atmospheric structure rebuilt per proposal**: D_zz(T,M), vm/vs, convergence-gate
+   Kzz, and the initial carry geometry now follow the retrieved T-P (the in-loop
+   hydrostatic refresh already did µ/g/H_p/dz from step 1 — the audit's "frozen
+   structure" claim was narrower than stated, but real for these pieces).
+3. **H₂-He CIA is required** everywhere (was silently skippable and WAS skipped by the
+   sensitivity demo / zco / Fisher-forecast caches — all those caches are stale and
+   must be regenerated); emission shares the transmission opacity terms (CIA + cloud;
+   Rayleigh deliberately transmission-only) and is labeled emergent flux.
+4. **Broadening knob** (`air`/`h2he`) + A/B script; hot-line-list limits documented as
+   accuracy caveats, per-molecule source swap points marked.
+5. **Evidence semantics fixed**: `logZ` is reported as evidence under the OPERATIONAL
+   prior (T-P window × converged support, renormalized); the measured support fraction
+   (persisted from init through checkpoints) and `logZ_box = logZ + ln f` ride with
+   every output. Warm-cap rejections are counted separately per sweep/stage
+   (`warmcap=`), and `validation/mala_reversibility.py` probes cap symmetry.
+   Tempered (β<1) draws are labeled on every figure/export path.
+6. **validate_warm now gates on three axes**: Δ logL (<0.1), binned-spectrum ppm
+   (<5), and elemental-inventory agreement — not logL alone.
+7. **jwst_tool v5**: floor-aware transits-to-target (photon term averages down, the
+   R=100-anchored floor does not — "never" is a possible answer), offset-marginalized
+   detection Δχ², d(λ)-weighted model binning, saturated modes excluded from all
+   forecasts consistently.
+8. **New validation suite** (`validation/`): `elemental_audit.py`,
+   `resolution_ladder.py`, `top_pressure_ladder.py`, `broadening_ab.py`,
+   `mala_reversibility.py` — the numerical-convergence and statistical checks the
+   audit required before interpreting a real-data posterior. **Run them on the GPU
+   node before the next production retrieval**; every pre-existing chemistry/spectrum
+   cache (demo npz, zco/Fisher caches, jwst_tool model cache, SMC checkpoints)
+   predates the physics fixes and is stale.
 
 ---
 

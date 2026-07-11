@@ -90,14 +90,30 @@ def make_bins(wl_lo: float, wl_hi: float, R: float) -> np.ndarray:
     return np.geomspace(wl_lo, wl_hi, n + 1)
 
 
+# The quoted per-mode systematic floors (instruments.MODES / Greene+2016-style
+# numbers) are per-bin values AT R=100 bins. A real systematic is spectrally
+# correlated, so it cannot be made to shrink by slicing the band into more bins:
+# treating a fixed per-bin floor as white noise inflated a floor-dominated
+# detection significance by ~sqrt(R_bin/100) when the bin slider moved 100->200.
+# Anchoring here keeps the floor-limited information content of the band
+# R-independent: per-bin floor = floor_ppm * sqrt(R_bin/R_REF) for finer bins.
+# Coarser-than-reference bins KEEP the full floor (no sqrt averaging-down --
+# conservative, systematics don't integrate out).
+FLOOR_REF_R = 100.0
+
+
 def depth_error_bins(mode_result: dict, edges: np.ndarray,
                      t_in_s: float, t_out_s: float, n_transits: int,
                      floor_ppm: float) -> dict:
     """Per-bin transit-depth sigma from a worker mode result.
 
-    Returns dict(wl_center, sigma, n_pix) with empty-pixel bins dropped.
-    The floor is added in quadrature AFTER the 1/sqrt(n_transits) scaling of the
-    photon/detector term -- systematics are assumed not to integrate down.
+    Returns dict(wl_center, sigma, n_pix, var_phot, floor, n_transits) with
+    empty-pixel bins dropped. ``var_phot`` is the photon/detector bin variance AT
+    the evaluated ``n_transits`` (it scales as 1/N); ``floor`` is the per-bin
+    R-anchored systematic (N-independent; see FLOOR_REF_R). sigma =
+    sqrt(var_phot + floor^2). Returning the two components separately is what
+    lets callers extrapolate to other transit counts CORRECTLY -- a plain
+    1/sqrt(N) scaling of sigma is optimistic wherever the floor contributes.
     """
     wl = np.asarray(mode_result["wl"])
     flux = np.asarray(mode_result["flux"])
@@ -118,6 +134,11 @@ def depth_error_bins(mode_result: dict, edges: np.ndarray,
             inv_var[b] = np.sum(1.0 / var_pix[sel])
             npx[b] = int(sel.sum())
     keep = npx > 0
-    sigma = np.sqrt(1.0 / inv_var[keep] + (floor_ppm * 1e-6) ** 2)
     centers = 0.5 * (edges[:-1] + edges[1:])
-    return dict(wl_center=centers[keep], sigma=sigma, n_pix=npx[keep])
+    var_phot = 1.0 / inv_var[keep]
+    r_bin = (centers / np.diff(edges))[keep]
+    floor = (floor_ppm * 1e-6) * np.sqrt(np.maximum(r_bin, FLOOR_REF_R) / FLOOR_REF_R)
+    sigma = np.sqrt(var_phot + floor ** 2)
+    return dict(wl_center=centers[keep], sigma=sigma, n_pix=npx[keep],
+                var_phot=var_phot, floor=floor,
+                n_transits=int(max(1, int(n_transits))))

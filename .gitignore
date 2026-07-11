@@ -20,3 +20,12 @@ runs/*/*.o[0-9]*
 # Editor / OS noise
 .vscode/
 .idea/
+
+# Packaging build artifacts (pip install -e .)
+*.egg-info/
+build/
+dist/
+
+# jwst_tool runtime caches (model spectra + pandeia results) -- regenerated per run
+data/jwst_tool/model_cache/
+data/jwst_tool/noise_cache/

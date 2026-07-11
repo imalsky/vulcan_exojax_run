@@ -22,11 +22,13 @@ exercised end-to-end:
 from __future__ import annotations
 
 import sys
+import os
 from pathlib import Path
 
 import numpy as np
 
-ROOT = Path("/Users/imalsky/Desktop/Emulators/VULCAN_Project")
+ROOT = Path(os.environ.get("VULCAN_PROJECT_ROOT",
+                            "/Users/imalsky/Desktop/Emulators/VULCAN_Project"))
 OUT = ROOT / "vulcan_exojax_run" / "data"
 sys.path.insert(0, str(ROOT / "vulcan_exojax_run" / "fisher_forecast"))   # noise_model sibling
 

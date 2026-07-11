@@ -1,0 +1,44 @@
+# Packaging for the vulcan_exojax_run bundle. EDITABLE install is the supported
+# mode (pip install -e .): the bundle's import contract is top-level modules
+# (config / vulcan_chem / exojax_rt / interp_map) next to the retrieval_framework
+# and jwst_tool packages, and the runtime expects the repository tree around it
+# (data/ caches, runs/ cases, the VULCAN-JAX sibling checkout addressed via
+# $VULCAN_PROJECT_ROOT). A site-packages (non-editable) install works for the
+# code but must set VULCAN_PROJECT_ROOT + JWST_TOOL_DATA_DIR explicitly.
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vulcan-exojax-run"
+version = "0.5.0"
+description = "VULCAN-JAX photochemistry -> ExoJAX transmission spectra: JWST instrument-selector tool, SMC retrieval framework, sensitivity/Fisher demos (WASP-39b)"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { file = "LICENSE" }
+authors = [{ name = "Isaac Malsky" }]
+dependencies = [
+    "jax>=0.6.2",
+    "exojax==2.2.3",
+    "numpy>=1.26",
+    "scipy>=1.11",
+    "matplotlib",
+    "corner",
+    "tqdm",
+    # pinned chemistry backend; bump the pin deliberately (see requirements.txt)
+    "vulcan-jax @ git+https://github.com/imalsky/jax-vulcan.git@4db8b053d73826a05af19cafe8955dd28662b41c",
+]
+
+[project.optional-dependencies]
+# the Streamlit GUI (jwst-tool console script); the Pandeia noise backend runs
+# in its OWN env (pandeia.engine 3.0) addressed via JWST_TOOL_PANDEIA_PYTHON
+gui = ["streamlit>=1.30", "pandas"]
+
+[project.scripts]
+jwst-tool = "jwst_tool.cli:main"
+
+[tool.setuptools]
+# top-level shared library modules -- the bundle's established import contract
+# (every subpackage and script does `import config` etc.)
+py-modules = ["config", "vulcan_chem", "exojax_rt", "interp_map"]
+packages = ["retrieval_framework", "jwst_tool"]

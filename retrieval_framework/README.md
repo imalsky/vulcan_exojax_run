@@ -327,11 +327,21 @@ dimension-independent.
 ## Outputs (per run dir, e.g. `data/gpu/`)
 
 `config.json` (full config + param metadata) · `observations.npz` ·
-`smc_checkpoint.npz` (atomic, per stage) · `posterior_samples.npz`
-(`samples (chains, n, dim)`) · `smc_extra_fields.npz` (β ladder, ESS, acceptance,
-step sizes, unique counts, logZ) · `posterior_predictive.npz` (PPC band + median
-model + χ²) · `timing.json` (calibrate mode) · `plots/{corner, spectrum_fit,
-tp_posterior, smc_diagnostics}.png` (PNG only, dpi 200).
+`smc_checkpoint.npz` (atomic, per stage; carries `init_stats_*` + `warm_capped`) ·
+`posterior_samples.npz` (`samples (chains, n, dim)` + `reached_beta1`) ·
+`smc_extra_fields.npz` (β ladder, ESS, acceptance, step sizes, unique counts,
+warm-cap counts, logZ **plus its conditioning**: `smc_log_support_fraction[_err]`
+and `smc_logZ_box`) · `posterior_predictive.npz` (PPC band + median model + χ²) ·
+`timing.json` (calibrate mode) · `plots/{corner, spectrum_fit, tp_posterior,
+smc_diagnostics}.png` (PNG only, dpi 200).
+
+**Evidence semantics (2026-07-11).** `smc_logZ` is the evidence under the
+OPERATIONAL prior — the declared box restricted to the modelable T-P window and to
+draws whose chemistry converges (the init reject-and-cull), renormalized. The
+support fraction is measured at init (binomial counts persisted through
+checkpoints) and `smc_logZ_box = smc_logZ + ln f_support` is the box-prior value
+with the non-evaluable region assigned zero likelihood. Quote them together;
+never compare `smc_logZ` across models whose support fractions differ.
 
 ## Honest limitations
 
@@ -350,12 +360,15 @@ tp_posterior, smc_diagnostics}.png` (PNG only, dpi 200).
   CO — adequate for the methodology; swap to HITEMP/ExoMol for publication-grade
   line fidelity (code-wise a dict entry; operationally multi-GB downloads + premodit
   memory tuning — the one upgrade with real wrangling risk).
-- The chemistry's internal transport geometry (dz, Dzz structure) stays at the
-  baseline W39b profile; the retrieved T-P drives kinetics, densities, and the RT
-  scale height (the spectrum's T response is fully carried). Same approximation as
-  the validated `fig_so2_temperature` pattern.
+- The chemistry's structure follows the retrieved T-P as of 2026-07-11: the runner's
+  in-loop hydrostatic refresh (µ/g/Hp/dz, firing from step 1) plus the per-proposal
+  on-graph rebuild of Dzz(T,M)/vm/vs, the convergence gate's Kzz, and the initial
+  carry geometry. The one remaining baseline-T bake is the photolysis
+  cross-section T-interpolation (host-side upstream step; second-order).
 - If the governor (or a crash) stops before β=1 the samples are **tempered**
-  (`reached_beta1=False` in the outputs) — widths are lower bounds. Resubmit with
+  (`reached_beta1=False` travels in BOTH `posterior_samples.npz` and
+  `smc_extra_fields.npz`; every figure — corner, spectrum, T-P — is stamped and the
+  PPC/recovery paths warn) — widths are lower bounds. Resubmit with
   `qsub -v RESUME=1 run_nas_w39b.pbs`: the ladder continues from the checkpointed
   cloud/β instead of restarting (validated in `test_smc_gaussian.py`).
 - Observations are baked into the jitted likelihood at first trace:

@@ -21,12 +21,14 @@ import csv
 import io
 import urllib.request
 import zipfile
+import os
 from pathlib import Path
 
 import numpy as np
 
 URL = "https://zenodo.org/records/10161743/files/ERS_DataSynthesis_Zenodo.zip"
-OUT = Path("/Users/imalsky/Desktop/Emulators/VULCAN_Project/vulcan_exojax_run/data")
+OUT = Path(os.environ.get("VULCAN_PROJECT_ROOT",
+                           "/Users/imalsky/Desktop/Emulators/VULCAN_Project")) / "vulcan_exojax_run" / "data"
 BASE = "ZENODO/4_TRANSMISSION_SPECTRA/Fit_LimbDarkening/"
 
 # Mode -> list of CSV members to concatenate (multi-detector / multi-order modes).

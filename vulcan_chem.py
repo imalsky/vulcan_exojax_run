@@ -6,19 +6,44 @@ convergence (which compiles & caches the JIT'd inner runner), then returns a mod
 
     theta = [lnZ, c_o, lnKzz, T_int]   (all scalars)
 
-Each knob reuses a *validated* jax_paper pattern (all forward-mode, all FD-checked there):
-  * lnZ    -> scale metal-bearing initial abundances   (fig_metallicity_sens.py)
-  * c_o    -> scale carbon-bearing initial abundances   (carbon-enrichment proxy for C/O)
-  * lnKzz  -> scale the eddy-diffusion profile           (fig_kzz_jvp.py)
-  * T_int  -> uniform T shift with rates rebuilt on-graph (fig_so2_temperature.py)
+Abundance knobs -- two modes (``profile["abundance_mode"]``):
+  * ``"masks"`` (legacy default): multiplicative species-mask y0 directions, the
+    validated jax_paper patterns (fig_metallicity_sens.py / fixed-O C/O). These are
+    NOT exact elemental directions: scaling every C/N/O/S-bearing species also moves
+    the hydrogen those molecules carry (~0.6% of elemental H per e-fold of Z at the
+    10x-solar baseline), the fixed-O b_z compensation leaks into N/S through NO/SO/SO2,
+    and the scaled column no longer sums to M = P/(kB T) until the runner's per-step
+    hydrostatic renorm restores it. Kept for reproducing the published demo caches.
+  * ``"elemental"`` (retrieval / production default via config_schema): the mask scaling
+    is only a smooth initial GUESS; the column is then renormalized to sum_i n_i = M
+    per layer and repaired (three fixed Newton-style iterations of a small linear solve
+    on the runner's own reservoir species He/H2O/CO/N2/H2S) so the column-integrated
+    elemental ratios hit the targets EXACTLY:
+        He/H = baseline,  O/H = Z x baseline,  N/H = Z x baseline,
+        S/H  = Z x baseline,  C/H = Z e^{c_o} x baseline   (=> dln(C/O) = c_o at fixed O/H)
+    with Z = e^lnZ relative to the FastChem baseline (fastchem_met_scale). The conserved
+    atom totals ``pv.atom_ini`` are rebuilt from the repaired column, so the runner's
+    atom-conservation anchor, the third-body density, the pressure, and the initial
+    composition all describe the same gas -- and cold/warm paths share identical
+    conserved inventories by construction (targets depend on theta only, never on the
+    warm-start history). ``reanchor_atom_ini`` is moot in this mode. Residuals after the
+    fixed iterations are ~1e-8 relative; measure them with ``audit_init``.
 
-Closed-column note: the runner forgets the initial speciation except through the conserved
-elemental column totals, so metallicity / carbon enrichment are correctly expressed as
-initial-abundance (y0) directions. FastChem (which set the EQ y0) stays frozen/off-graph;
-we perturb y0 directly, exactly as the validated metallicity script does.
+Temperature / atmosphere: rate constants are rebuilt on-graph (rates_jax) and the
+ATMOSPHERIC STRUCTURE now follows the proposed T-P/composition too. The runner itself
+refreshes the hydrostatic geometry (mu, g, Hp, dz, dzi, Hpi) in-loop from the live
+composition and ``pv.r_Tco`` every ``update_frq`` accepted steps (first firing on the
+first accepted step), so the converged column was already hydrostatically consistent;
+what was frozen at the baseline was (a) the molecular-diffusion coefficients Dzz(T, M)
+(+ the derived vm / settling vs), (b) the convergence gate's ``pv.Kzz``, and (c) the
+initial carry geometry for step 1. All three are now rebuilt per proposal via the
+committed on-graph builders (vulcan_jax.atm_jax / atm_refresh). Still frozen by design:
+the photolysis cross-section T-interpolation (host-side re-bake upstream; second-order)
+and any condensation saturation tables -- ``use_condense=True`` therefore refuses a
+T-varying build loudly rather than run with baseline-T saturation curves.
 
 The runner's lax.while_loop supports jvp/jacfwd but NOT vjp, so forward-mode is the
-end-to-end route -- which is also optimal here (4 scalar inputs -> high-dim spectrum).
+end-to-end route -- which is also optimal here (few scalar inputs -> high-dim spectrum).
 """
 from __future__ import annotations
 
@@ -43,6 +68,18 @@ import jax.numpy as jnp  # noqa: E402
 
 jax.config.update("jax_enable_x64", True)
 
+# Column-repair pairs for the exact-elemental mode: element -> adjuster species.
+# These are the runner's own atom-conservation reservoirs (jax_step._ATOM_RESERVOIRS),
+# i.e. the abundant carrier of each element in an H2-dominated gas, so the linear
+# repair stays tiny and well-conditioned across the retrieval prior box. H is the
+# reference element (its absolute density is set by sum_i n_i = M); He preserves the
+# baseline He/H.
+_ELEMENTAL_REPAIR = (("He", "He"), ("O", "H2O"), ("C", "CO"), ("N", "N2"), ("S", "H2S"))
+# Number of renorm+repair iterations. Each iteration nails the column ratios exactly,
+# then the per-layer renorm to M perturbs them by O(alpha x layer heterogeneity); the
+# residual contracts geometrically (~1e-2 -> ~1e-8 by three passes; see audit_init).
+_ELEMENTAL_REPAIR_ITERS = 3
+
 
 def build_chem_model(profile: dict, tp_eval=None, n_tp_params: int = 0) -> SimpleNamespace:
     """Build the converged WASP-39b model and the differentiable converged_ymix(theta).
@@ -51,14 +88,16 @@ def build_chem_model(profile: dict, tp_eval=None, n_tp_params: int = 0) -> Simpl
     ----------
     profile : dict
         One of ``config.SMOKE`` / ``config.FULL`` -- supplies ``use_photo`` and
-        ``yconv_cri``.
+        ``yconv_cri``. ``profile["abundance_mode"]`` selects "masks" (legacy) or
+        "elemental" (exact conserved-inventory construction; see module docstring).
     tp_eval : callable or None, optional
         Temperature-profile hook. When ``None`` (default, unchanged behavior) the
         temperature is the validated uniform shift ``T = T_base + theta[3]`` (theta[3]
-        is ``T_int``). When supplied, ``tp_eval(theta[3:3+n_tp_params], p_bar)`` returns
-        the full (nz,) T-P profile (bar-indexed) that replaces the scalar shift -- used
-        by the retrieval framework to retrieve an ExoJax Guillot/power-law T-P. The
-        rest of the chemistry (rate rebuild on-graph, n_0, Ti, pv carry) is identical.
+        is a bulk offset; the demo's historical "T_int" label). When supplied,
+        ``tp_eval(theta[3:3+n_tp_params], p_bar)`` returns the full (nz,) T-P profile
+        (bar-indexed) that replaces the scalar shift -- used by the retrieval framework
+        to retrieve an ExoJax Guillot/power-law T-P. Either way the rate table AND the
+        T/composition-dependent atmospheric structure are rebuilt on-graph.
     n_tp_params : int, optional
         Number of T-P parameters consumed from ``theta[3:]`` when ``tp_eval`` is given.
 
@@ -66,6 +105,7 @@ def build_chem_model(profile: dict, tp_eval=None, n_tp_params: int = 0) -> Simpl
     -------
     SimpleNamespace with fields:
         converged_ymix(theta) -> (nz, ni) linear VMR, float64, differentiable
+        audit_init(theta) -> host-side dict of elemental/density residuals at init
         T_base   : (nz,) baseline temperature (np.float64)
         p_bar    : (nz,) pressure grid in bar (np.float64)
         sidx     : dict species-name -> column index
@@ -117,6 +157,8 @@ def build_chem_model(profile: dict, tp_eval=None, n_tp_params: int = 0) -> Simpl
 
     from vulcan_jax.state import RunState, legacy_view
     from vulcan_jax import network as net_mod, composition, rates_jax
+    from vulcan_jax import atm_jax, atm_refresh as atm_refresh_mod
+    from vulcan_jax.atm_setup import _VISCOSITY_TABLE, settling_velocity_jax
     from vulcan_jax.jax_step import make_atm_static
     from vulcan_jax.gibbs import load_nasa9
     from vulcan_jax._paths import resolve_data_path
@@ -124,6 +166,16 @@ def build_chem_model(profile: dict, tp_eval=None, n_tp_params: int = 0) -> Simpl
     import vulcan_jax.legacy_io as op
     import vulcan_jax.op_jax as op_jax
     import vulcan_jax.outer_loop as outer_loop
+
+    # Condensation saturation/growth tables (ProfileVars c_*) are baked at the BASELINE
+    # temperature and are NOT rebuilt per proposal. Running a T-varying model over them
+    # would silently use wrong saturation curves -- refuse instead (standing rule:
+    # loud errors, no silent fallbacks). All shipped W39b/zco configs have conden off.
+    if bool(getattr(cfg, "use_condense", False)):
+        raise NotImplementedError(
+            "use_condense=True is incompatible with the T-varying chemistry model: the "
+            "condensation saturation/diffusion tables are frozen at the baseline T-P. "
+            "Rebuild them on-graph before enabling condensation here.")
 
     rs = RunState.with_pre_loop_setup(cfg)
     var, atm, para = legacy_view(rs)
@@ -174,10 +226,30 @@ def build_chem_model(profile: dict, tp_eval=None, n_tp_params: int = 0) -> Simpl
     pv0 = state0.pv
     T_base = jnp.asarray(np.asarray(atm.Tco, dtype=np.float64))
 
+    # --- on-graph atmosphere rebuild inputs -------------------------------
+    # refresh_static packs the runner's own hydrostatic-refresh kernel inputs (pico,
+    # gs, Rp, pref anchor, species masses); update_mu_dz_jax(ymix, st) is exactly what
+    # the runner fires in-loop every update_frq accepted steps, so seeding the initial
+    # carry with it makes step 1 consistent with what the loop maintains thereafter.
+    # phys0/spec_atm feed atm_jax._mol_diff, the committed on-graph Dzz(T, M) builder
+    # (field-for-field equal to the host make_atm_static for this atm_type; validated
+    # in VULCAN-JAX tests/test_atm_jax.py).
+    refresh_static = integ._build_refresh_static(var, atm)
+    phys0, spec_atm = atm_jax.make_physical_inputs(cfg, var, atm, list(network.species))
+    use_vm = bool(spec_atm.use_vm_mol and spec_atm.use_moldiff)
+    use_set = bool(spec_atm.use_settling and spec_atm.use_moldiff)
+
     # --- composition masks for the y0 knobs -------------------------------
     compo = np.asarray(composition.compo_array)
     metal_cols = [config.ATOM_COLS[a] for a in ("O", "C", "N", "S")]
-    metal_mask = jnp.asarray((compo[:, metal_cols].sum(axis=1) > 0).astype(np.float64))  # scale C/N/O/S; H,He fixed
+    # Scales every C/N/O/S-bearing species. NOTE (elemental accounting): the hydrogen
+    # bound in those molecules (H2O, CH4, NH3, H2S, OH, ...) scales along with them, so
+    # this is NOT an exact "metals only, H/He fixed" elemental direction -- standalone
+    # H2/He are untouched but elemental H shifts by the bound-H fraction (~0.6% per
+    # e-fold of Z at the 10x-solar baseline, growing toward the 100x edge). In
+    # abundance_mode="elemental" this is only the initial guess and the exact repair
+    # below removes the leakage; in legacy "masks" mode it IS the knob definition.
+    metal_mask = jnp.asarray((compo[:, metal_cols].sum(axis=1) > 0).astype(np.float64))
     carbon_mask = jnp.asarray((compo[:, config.ATOM_COLS["C"]] > 0).astype(np.float64))  # C/O proxy
     # fixed-O C/O mode ("co_mode": "fixed_O"): every C atom lives in a C-bearing species,
     # and the O-carriers holding no C (H2O, OH, O2, SO, SO2, NO, ...) are disjoint from
@@ -192,20 +264,54 @@ def build_chem_model(profile: dict, tp_eval=None, n_tp_params: int = 0) -> Simpl
     # runner's own (ni, n_atoms) composition table, columns in its internal _atom_order --
     # used to rebuild the conserved atom totals (atom_ini) in the runner's exact basis.
     compo_run = jnp.asarray(np.asarray(integ._compo_arr, dtype=np.float64))
-    # Opt-in: re-anchor the conserved atom totals to the perturbed column (needed for finite
-    # metallicity/C-O steps; see _prep). OFF by default so the Fisher/sensitivity demo
-    # (config.FULL) keeps its exact published behavior; the Hessian campaign turns it on.
+    # Legacy-mode opt-in: re-anchor the conserved atom totals to the perturbed column
+    # (needed for finite metallicity/C-O steps in "masks" mode; see _prep). Moot in
+    # "elemental" mode, where atom_ini is ALWAYS rebuilt from the repaired column.
     reanchor_atom_ini = bool(profile.get("reanchor_atom_ini", False))
     # Opt-in: zero the eddy-diffusion profile entirely (the no-transport equilibrium tier;
     # combine with cfg_overrides={"use_moldiff": False} so Dzz is off too). lnKzz is then inert.
     zero_kzz = bool(profile.get("zero_Kzz", False))
+    abundance_mode = str(profile.get("abundance_mode", "masks"))
+    if abundance_mode not in ("masks", "elemental"):
+        raise ValueError(f"abundance_mode={abundance_mode!r}: expected 'masks' or 'elemental'")
+
+    # --- exact-elemental targets + repair tables (abundance_mode="elemental") ----
+    # Baseline column-integrated elemental totals from the pristine y0 (which sums to
+    # M_base per layer by construction: FastChem mixing ratios x n_0). Targets are
+    # RATIOS to elemental H; absolute densities follow from sum_i n_i = M.
+    elem_pairs = [(e, sp) for e, sp in _ELEMENTAL_REPAIR
+                  if sp in sidx and compo[:, config.ATOM_COLS[e]].sum() > 0]
+    _y0_np = np.asarray(y0, dtype=np.float64)
+    _elem_cols = [config.ATOM_COLS["H"]] + [config.ATOM_COLS[e] for e, _ in elem_pairs]
+    # (ni, 1+nrep) atoms-per-molecule for [H, He, O, C, N, S]-as-present
+    E_mat = jnp.asarray(np.asarray(compo[:, _elem_cols], dtype=np.float64))
+    rep_cols = np.asarray([sidx[sp] for _, sp in elem_pairs], dtype=np.int64)
+    A0 = _y0_np @ np.asarray(compo[:, _elem_cols], dtype=np.float64)  # per-layer (nz, 1+nrep)
+    A0 = A0.sum(axis=0)                                               # column totals
+    if abundance_mode == "elemental":
+        missing = [sp for _, sp in _ELEMENTAL_REPAIR if sp not in sidx]
+        if not elem_pairs:
+            raise RuntimeError("elemental mode: no repair species found in the network")
+        R0_ratios = A0[1:] / A0[0]
+        # per-element theta-scaling kind: He fixed; O/N/S x Z; C x Z e^{c_o}
+        _zk = np.asarray([0.0 if e == "He" else 1.0 for e, _ in elem_pairs])
+        _ck = np.asarray([1.0 if e == "C" else 0.0 for e, _ in elem_pairs])
+        zscale_kind = jnp.asarray(_zk)
+        cscale_kind = jnp.asarray(_ck)
+        R0_j = jnp.asarray(R0_ratios)
+        print("[chem] elemental mode: exact column ratios to H via repair species "
+              f"{[sp for _, sp in elem_pairs]}"
+              + (f" (absent: {missing})" if missing else "")
+              + "; baseline C/O = "
+              f"{A0[1 + [e for e, _ in elem_pairs].index('C')] / A0[1 + [e for e, _ in elem_pairs].index('O')]:.4f}",
+              flush=True)
 
     co_bz_bound = float("inf")   # proxy mode has no b_z compensation -> no bound
     if co_fixed_o:
         # Build-time diagnostics for the fixed-O C/O knob: baseline C/O, how much of the
         # column's O sits in C-carriers (sets the b_z compensation), and the worst-layer
         # O-only share (b_z blows up where O-only carriers vanish).
-        _y0n = np.asarray(y0, dtype=np.float64)
+        _y0n = _y0_np
         _nC = np.asarray(compo[:, config.ATOM_COLS["C"]], dtype=np.float64)
         _nO = np.asarray(compo[:, config.ATOM_COLS["O"]], dtype=np.float64)
         _mC = np.asarray(carbon_mask); _mOo = np.asarray(o_only_mask)
@@ -220,35 +326,40 @@ def build_chem_model(profile: dict, tp_eval=None, n_tp_params: int = 0) -> Simpl
               f"median {np.median(_OC_z/(_OC_z+_OO_z)):.3f}, max {np.max(_OC_z/(_OC_z+_OO_z)):.3f} "
               f"(b_z stays positive for c_o < {co_bz_bound:.2f})", flush=True)
 
-    def _prep(theta, warm_y=None, lnZ_ref=0.0, c_o_ref=0.0):
-        """Build the perturbed initial runner state + atm for theta=[lnZ, c_o, lnKzz, T_int].
+    rep_cols_j = jnp.asarray(rep_cols)
 
-        Continuation: pass warm_y = a previously-CONVERGED y (and its lnZ_ref / c_o_ref) to
-        warm-start from there instead of the fixed baseline y0. The metallicity AND C/O scales
-        are then applied INCREMENTALLY (lnZ - lnZ_ref, c_o - c_o_ref), so a large absolute
-        perturbation is reached by small steps from a nearby converged state -- which avoids
-        the runner's snap-back-to-baseline, and (for C/O) avoids double-applying the C/O
-        scaling to a warm_y that already carries it (a fixed-C/O metallicity march passes
-        c_o_ref = c_o so the C/O factor is a no-op after the first step)."""
-        lnZ, c_o, lnKzz = theta[0], theta[1], theta[2]
+    def _elemental_project(y_in, M, lnZ, c_o):
+        """Renormalize to sum_i n_i = M and repair the column elemental ratios exactly.
+
+        y_in : (nz, ni) guessed absolute densities. Returns (y_out, min_adj) where
+        y_out rows sum to M and the column ratios-to-H equal the theta targets to the
+        fixed-iteration residual (~1e-8 rel; audit_init measures it), and min_adj is
+        the smallest per-species repair factor (must stay > 0 for a physical column;
+        it is ~1 +/- the mask-leakage scale everywhere in the shipped prior boxes).
+        """
+        targets = R0_j * jnp.exp(lnZ * zscale_kind + c_o * cscale_kind)  # (nrep,)
+        y = y_in * (M / jnp.sum(y_in, axis=1))[:, None]
+        min_adj = jnp.asarray(1.0, dtype=jnp.float64)
+        for _ in range(_ELEMENTAL_REPAIR_ITERS):
+            A = jnp.einsum("zi,ie->e", y, E_mat)                # [H, e1..] column totals
+            col_tot = jnp.sum(y[:, rep_cols_j], axis=0)         # (nrep,) adjuster columns
+            B = E_mat[rep_cols_j, :].T * col_tot[None, :]       # (1+nrep, nrep)
+            Msys = B[1:, :] - targets[:, None] * B[0:1, :]
+            rhs = targets * A[0] - A[1:]
+            alpha = jnp.linalg.solve(Msys, rhs)                 # (nrep,) additive factors
+            min_adj = jnp.minimum(min_adj, jnp.min(1.0 + alpha))
+            scale_vec = jnp.ones(ni, dtype=jnp.float64).at[rep_cols_j].set(1.0 + alpha)
+            y = y * scale_vec[None, :]
+            y = y * (M / jnp.sum(y, axis=1))[:, None]
+        return y, min_adj
+
+    def _guess_y0(lnZ, c_o, warm_y=None, lnZ_ref=0.0, c_o_ref=0.0):
+        """Mask-scaled initial-composition GUESS (shared by _prep and audit_init).
+
+        From the baseline (warm_y=None) the full lnZ/c_o is applied; in continuation
+        only the increments (lnZ - lnZ_ref, c_o - c_o_ref) are, so a large absolute
+        perturbation is reached by small steps from a nearby converged state."""
         c_o_inc = c_o - c_o_ref     # incremental C/O relative to the warm state
-
-        # Temperature: default is the validated uniform T shift theta[3] (T_int); with a
-        # tp_eval hook the full differentiable T-P profile theta[3:3+n_tp_params] is used
-        # instead. Either way rate constants are rebuilt ON-GRAPH (rates_jax), with
-        # n_0 = pco/(kb T), Ti, and the pv carry (fig_so2_temperature pattern).
-        if tp_eval is None:
-            T = T_base + theta[3]
-        else:
-            T = tp_eval(theta[3:3 + n_tp_params], p_bar_j)
-        M = pco / (kb * T)
-        k_arr = rates_jax.build_rate_array(network, T, M, nasa9, remove_list)
-        Ti = 0.5 * (T[:-1] + T[1:])
-        Kzz_eff = Kzz0 * 0.0 if zero_kzz else Kzz0 * jnp.exp(lnKzz)
-        atm_T = atm_static._replace(Tco=T, Ti=Ti, M=M, Kzz=Kzz_eff)
-
-        # Z + C/O: multiplicative y0 directions on the conserved element totals. From the
-        # baseline (warm_y=None) the full lnZ is applied; in continuation only (lnZ - lnZ_ref).
         base = y0 if warm_y is None else warm_y
         if co_fixed_o:
             # c_o == delta ln(C/O) at fixed O, EXACTLY, layer by layer: scaling every
@@ -267,25 +378,89 @@ def build_chem_model(profile: dict, tp_eval=None, n_tp_params: int = 0) -> Simpl
         else:
             scale = jnp.exp((lnZ - lnZ_ref) * metal_mask + c_o_inc * carbon_mask)  # (ni,)
             y0p = base * scale[None, :]
-        ymix0 = y0p / jnp.sum(y0p, axis=1, keepdims=True)
+        return y0p
 
-        # CRITICAL (opt-in): re-anchor the conserved atom totals to the PERTURBED column. The
-        # runner's atom-conservation (_compute_atom_loss) measures drift from pv.atom_ini; if
-        # atom_ini stays at the baked baseline, finite metallicity/C-O steps that exceed the
-        # loss threshold get the added metals driven back to baseline (the "snap to baseline"
-        # seen for lnZ >= +0.10). Rebuilding atom_ini = sum_z compo^T y0p in the runner's own
-        # basis makes the column conserve its own higher totals. Smooth in theta -> AD-safe.
-        if reanchor_atom_ini:
-            atom_ini_new = jnp.einsum("zi,ia->a", y0p, compo_run)  # (n_atoms,) runner order
-            pv_T = pv0._replace(n_0=M, r_Tco=T, atom_ini=atom_ini_new)
+    def _prep(theta, warm_y=None, lnZ_ref=0.0, c_o_ref=0.0):
+        """Build the perturbed initial runner state + atm for theta=[lnZ, c_o, lnKzz, T...].
+
+        Continuation: pass warm_y = a previously-CONVERGED y (and its lnZ_ref / c_o_ref)
+        to warm-start from there instead of the fixed baseline y0 (see _guess_y0). In
+        "elemental" mode the guess is then projected onto the EXACT theta targets (which
+        depend on theta only), so the conserved inventory is path-independent; in legacy
+        "masks" mode the incremental scaling IS the map (avoids the runner's
+        snap-back-to-baseline, and avoids double-applying C/O to a warm_y that already
+        carries it -- a fixed-C/O metallicity march passes c_o_ref = c_o)."""
+        lnZ, c_o, lnKzz = theta[0], theta[1], theta[2]
+
+        # Temperature: default is the validated uniform T shift theta[3]; with a tp_eval
+        # hook the full differentiable T-P profile theta[3:3+n_tp_params] is used instead.
+        # Either way rate constants are rebuilt ON-GRAPH (rates_jax), with n_0 = pco/(kb T),
+        # Ti, and the pv carry (fig_so2_temperature pattern).
+        if tp_eval is None:
+            T = T_base + theta[3]
         else:
-            pv_T = pv0._replace(n_0=M, r_Tco=T)
+            T = tp_eval(theta[3:3 + n_tp_params], p_bar_j)
+        M = pco / (kb * T)
+        k_arr = rates_jax.build_rate_array(network, T, M, nasa9, remove_list)
+        Ti = 0.5 * (T[:-1] + T[1:])
+        Kzz_eff = Kzz0 * 0.0 if zero_kzz else Kzz0 * jnp.exp(lnKzz)
 
-        init = state0._replace(y=y0p, ymix=ymix0, k_arr=k_arr, pv=pv_T)
+        y0p = _guess_y0(lnZ, c_o, warm_y=warm_y, lnZ_ref=lnZ_ref, c_o_ref=c_o_ref)
+
+        if abundance_mode == "elemental":
+            # Exact construction: sum_i n_i = M per layer AND exact column elemental
+            # ratios; atom_ini rebuilt from the repaired column so the conservation
+            # anchor matches the actual initial gas (no reanchor knob needed).
+            y0p, _min_adj = _elemental_project(y0p, M, lnZ, c_o)
+            ymix0 = y0p / M[:, None]
+            atom_ini_new = jnp.einsum("zi,ia->a", y0p, compo_run)  # runner atom order
+            pv_T = pv0._replace(n_0=M, r_Tco=T, Kzz=Kzz_eff, atom_ini=atom_ini_new)
+        else:
+            ymix0 = y0p / jnp.sum(y0p, axis=1, keepdims=True)
+            # Legacy masks mode, opt-in: re-anchor the conserved atom totals to the
+            # PERTURBED column. The runner's atom-conservation (_compute_atom_loss)
+            # measures drift from pv.atom_ini; if atom_ini stays at the baked baseline,
+            # finite metallicity/C-O steps that exceed the loss threshold get the added
+            # metals driven back to baseline (the "snap to baseline" seen for
+            # lnZ >= +0.10). NOTE: y0p is NOT renormalized to M here (published-demo
+            # behavior); the runner's first hydrostatic renorm rescales it, so atom_ini
+            # computed from the raw y0p mismatches the post-renorm gas by the scaled
+            # metal fraction. The "elemental" mode removes this inconsistency.
+            if reanchor_atom_ini:
+                atom_ini_new = jnp.einsum("zi,ia->a", y0p, compo_run)
+                pv_T = pv0._replace(n_0=M, r_Tco=T, Kzz=Kzz_eff, atom_ini=atom_ini_new)
+            else:
+                pv_T = pv0._replace(n_0=M, r_Tco=T, Kzz=Kzz_eff)
+
+        # --- atmospheric structure at the proposed T + composition --------
+        # Hydrostatic geometry via the runner's OWN refresh kernel (so the initial
+        # carry equals what the in-loop refresh maintains); Dzz/vm/vs via the
+        # committed on-graph builder at the proposed (T, M). The runner splices the
+        # carry geometry into every step and recomputes vm in-loop from atm.Dzz, so
+        # rebuilding Dzz here fixes the whole molecular-diffusion channel.
+        refresh_lane = refresh_static._replace(Tco=T)
+        mu_i, g_i, Hp_i, dz_i, zco_i, dzi_i, Hpi_i = atm_refresh_mod.update_mu_dz_jax(
+            ymix0, refresh_lane)
+        Dzz_new, _Dzz_cen, vm_new = atm_jax._mol_diff(
+            phys0._replace(Tco=T), spec_atm, M, g_i, Hp_i, dz_i)
+        if not use_vm:
+            vm_new = jnp.zeros((nz - 1, ni), dtype=jnp.float64)
+        if use_set:
+            _na, _a, _b = _VISCOSITY_TABLE[spec_atm.atm_base]
+            vs_new = settling_velocity_jax(_na, _a, _b, T, g_i, spec_atm.settle_coeff)
+        else:
+            vs_new = jnp.zeros((nz - 1, ni), dtype=jnp.float64)
+        pv_T = pv_T._replace(r_Dzz_top=Dzz_new[-1])
+        atm_T = atm_static._replace(Tco=T, Ti=Ti, M=M, Kzz=Kzz_eff, Dzz=Dzz_new,
+                                    vm=vm_new, vs=vs_new, g=g_i, dzi=dzi_i, Hpi=Hpi_i)
+
+        init = state0._replace(y=y0p, ymix=ymix0, k_arr=k_arr, pv=pv_T,
+                               mu=mu_i, g=g_i, Hp=Hp_i, dz=dz_i, zco=zco_i,
+                               dzi=dzi_i, Hpi=Hpi_i, vs=vs_new)
         return init, atm_T
 
     def converged_ymix(theta):
-        """Re-converge the WASP-39b column under theta=[lnZ, c_o, lnKzz, T_int].
+        """Re-converge the WASP-39b column under theta=[lnZ, c_o, lnKzz, T...].
 
         Returns linear VMR (nz, ni). Differentiable end-to-end via forward-mode.
         """
@@ -327,10 +502,54 @@ def build_chem_model(profile: dict, tp_eval=None, n_tp_params: int = 0) -> Simpl
             return final.y, final.accept_count
         return final.y
 
+    def audit_init(theta, warm_y=None, lnZ_ref=0.0, c_o_ref=0.0):
+        """Host-side audit of the initial column built for ``theta`` (not on any AD path).
+
+        Returns a dict with the quantities the science review asked to see verified at
+        every retrieval point: relative density-closure error max_z |sum_i n_i - M|/M,
+        the achieved-vs-target column elemental ratios (elemental mode) or the raw
+        achieved ratios (masks mode), the achieved dln(C/O) vs theta, the smallest
+        elemental-repair factor (elemental mode; must be > 0), and the atom_ini
+        consistency |atoms(y_init) - atom_ini|/atom_ini in the runner's atom basis.
+        """
+        th = jnp.asarray(theta, dtype=jnp.float64)
+        init, _atm_T = _prep(th, warm_y=warm_y, lnZ_ref=lnZ_ref, c_o_ref=c_o_ref)
+        y = np.asarray(init.y, dtype=np.float64)
+        Mn = np.asarray(init.pv.n_0, dtype=np.float64)
+        A = (y @ np.asarray(compo[:, _elem_cols], dtype=np.float64)).sum(axis=0)
+        ratios = A[1:] / A[0]
+        names = [e for e, _ in elem_pairs]
+        out = {
+            "density_closure_max_rel": float(np.max(np.abs(y.sum(axis=1) - Mn) / Mn)),
+            "ratios_to_H": dict(zip(names, ratios.tolist())),
+            "baseline_ratios_to_H": dict(zip(names, (A0[1:] / A0[0]).tolist())),
+        }
+        if "C" in names and "O" in names:
+            r_now = ratios[names.index("C")] / ratios[names.index("O")]
+            r_base = (A0[1:] / A0[0])[names.index("C")] / (A0[1:] / A0[0])[names.index("O")]
+            out["dln_CO_achieved"] = float(np.log(r_now / r_base))
+        if abundance_mode == "elemental":
+            tg = np.asarray(R0_j) * np.exp(float(th[0]) * np.asarray(zscale_kind)
+                                           + float(th[1]) * np.asarray(cscale_kind))
+            out["target_ratios_to_H"] = dict(zip(names, tg.tolist()))
+            out["ratio_max_rel_err"] = float(np.max(np.abs(ratios / tg - 1.0)))
+            # Re-run the projection from the raw GUESS to expose the actual repair
+            # magnitude (projecting the already-repaired y would always report ~1).
+            y_guess = _guess_y0(th[0], th[1], warm_y=warm_y,
+                                lnZ_ref=lnZ_ref, c_o_ref=c_o_ref)
+            _yg, min_adj = _elemental_project(y_guess, jnp.asarray(Mn), th[0], th[1])
+            out["min_repair_factor"] = float(min_adj)
+        ai = np.asarray(init.pv.atom_ini, dtype=np.float64)
+        a_run = y @ np.asarray(integ._compo_arr, dtype=np.float64)
+        out["atom_ini_max_rel_err"] = float(np.max(np.abs(a_run.sum(axis=0) - ai) / ai))
+        return out
+
     return SimpleNamespace(
         converged_ymix=converged_ymix,
         run_diag=run_diag,
         converged_y=converged_y,
+        audit_init=audit_init,
+        abundance_mode=abundance_mode,
         co_bz_bound=co_bz_bound,   # fixed-O knob validity: b_z > 0 iff c_o < this (baseline column)
         y0=np.asarray(y0, dtype=np.float64),   # baked baseline column (warm-start fallback)
         compo_array=compo,

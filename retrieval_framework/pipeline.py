@@ -234,9 +234,16 @@ def build_pipeline(cfg: C.Config) -> Pipeline:
     # proposal gets -inf likelihood (rejected) at every beta>0.
     _tp_valid_batch = jax.jit(lambda U: jax.vmap(lambda u: tp_valid(theta_from_u(u)))(U))
 
+    # Running tally of the T-P window rejection sampling: n_kept/n_drawn estimates the
+    # window's prior mass, one of the two factors in the operational-prior support
+    # fraction reported next to the evidence (the other is the init convergence cull).
+    tp_prior_stats = {"n_drawn": 0, "n_kept": 0}
+
     def sample_prior_u_valid(rng_key, n_particles):
         n_particles = int(n_particles)
         if n_tp == 0:
+            tp_prior_stats["n_drawn"] += n_particles
+            tp_prior_stats["n_kept"] += n_particles
             return sample_prior_u(rng_key, n_particles)
         key = rng_key
         kept, have, drawn = [], 0, 0
@@ -259,6 +266,8 @@ def build_pipeline(cfg: C.Config) -> Pipeline:
                     "prior_Tirr / prior_log10gamma in case.py so realistic W39b profiles "
                     "dominate instead of being redrawn away.")
         U = np.concatenate(kept, axis=0)[:n_particles]
+        tp_prior_stats["n_drawn"] += int(drawn)
+        tp_prior_stats["n_kept"] += int(have)
         n_cand = drawn
         if n_cand > 2 * n_particles:
             logger.info(f"prior T-P rejection: kept {n_particles} valid draws from "
@@ -627,6 +636,12 @@ def build_pipeline(cfg: C.Config) -> Pipeline:
                 # the cold grad path, so `converged` is all-True there and nothing changes.
                 usable = valid & (ACC < wcmax)
                 n_bad = jnp.sum((bads & usable).astype(jnp.int32))
+                # warm-cap hits broken out from the generic reject count: the MH
+                # correction only knows the Langevin proposal density, so a cap that
+                # binds often (and possibly state-dependently) is a detailed-balance
+                # risk -- it must be VISIBLE per sweep/stage, not folded into
+                # "rejected". See validate_warm/reversibility notes.
+                n_capped = jnp.sum((valid & (ACC >= wcmax)).astype(jnp.int32))
             elif diag:
                 AUX, Ynew, worst_accept = jax.vmap(_chem_one)(C_, Y, refs)
                 vals = _map_chunked(_rt_val, (AUX, Theta), rt_chunk)
@@ -655,7 +670,7 @@ def build_pipeline(cfg: C.Config) -> Pipeline:
                     # tell a re-certification failure (ACC >= count_max: cull) from
                     # a true RT/AD blow-up (finite ACC, non-finite forward: raise)
                     return L, G, Ynew, refs_new, n_bad, DY, ACC
-                return L, G, Ynew, refs_new, n_bad, DY
+                return L, G, Ynew, refs_new, n_bad, DY, n_capped
             if diag:
                 return L, Ynew, refs_new, worst_accept
             return L, Ynew, refs_new
@@ -677,6 +692,7 @@ def build_pipeline(cfg: C.Config) -> Pipeline:
         # sampler + the validity predicate are exposed for diagnostics/calibration.
         theta_from_u=theta_from_u, log_prior_u=log_prior_u, sample_prior_u=sample_prior_u_valid,
         sample_prior_u_box=sample_prior_u, tp_valid=tp_valid, n_tp=n_tp,
+        tp_prior_stats=tp_prior_stats,
         theta_truth=theta_truth,
         observed_depth_model=observed_depth_model, observed_depth_model_jit=observed_depth_model_jit,
         log_likelihood_u=log_likelihood_u, loglik_fwd=loglik_fwd, use_custom_grads=use_custom,
@@ -801,8 +817,11 @@ def _abs_scale_diag(particles: np.ndarray, cap: float) -> np.ndarray:
 
 def _get_batch_evals(pipe: Pipeline):
     """(cold_vg, cold_l, move_vg, move_l) batched evaluators. Gradient evaluators
-    return (L, G, Y_new, refs_new, n_bad, DY) -- DY is None unless the pipeline was
-    built with warm_extrapolate -- and likelihood-only ones (L, Y_new, refs_new).
+    return the 7-tuple (L, G, Y_new, refs_new, n_bad, DY, tail) -- DY is None unless
+    the pipeline was built with warm_extrapolate; ``tail`` is the per-batch
+    warm-cap-hit count n_capped for move/cold evals (a constant 0 for stubs and cold
+    maps) or the per-particle accept counts ACC for batch_eval_init_vg
+    (mutation_cap=False). Likelihood-only evaluators return (L, Y_new, refs_new).
     Real pipelines carry the staged chemistry+RT evaluators; stub pipes (unit tests,
     no chemistry) get a stateless adapter so the SMC/MALA core is exercised through
     the exact same code path."""
@@ -815,7 +834,10 @@ def _get_batch_evals(pipe: Pipeline):
         def eval_vg(U, Y, refs):
             L, G = jax.vmap(vg1)(U)
             bad = jnp.isfinite(L) & ~jnp.all(jnp.isfinite(G), axis=1)
-            return L, G, Y, refs, jnp.sum(bad.astype(jnp.int32)), None
+            # trailing scalar mirrors the real move eval's n_capped (stubs have no
+            # warm cap, so it is always 0) -- keeps the 7-tuple contract uniform
+            return (L, G, Y, refs, jnp.sum(bad.astype(jnp.int32)), None,
+                    jnp.zeros((), jnp.int32))
 
         def eval_l(U, Y, refs):
             return jax.vmap(pipe.log_likelihood_u)(U), Y, refs
@@ -844,7 +866,7 @@ def _init_draw_count(pipe: Pipeline, n_target: int) -> int:
     n_target = int(n_target)
     if not getattr(pipe, "has_chem_state", False):
         return n_target
-    over = float(getattr(pipe.cfg, "init_oversample", 1.6))
+    over = float(getattr(pipe.cfg, "init_oversample", 2.0))  # matches the schema default
     return max(n_target, int(math.ceil(n_target * over)))
 
 
@@ -950,7 +972,7 @@ def _init_state(pipe: Pipeline, U, target_n: Optional[int] = None):
         raise RuntimeError(
             f"only {n_alive}/{M} cold draws converged; need {target_n}. The "
             "reject-and-cull ran out of survivors: raise init_oversample (currently "
-            f"{float(getattr(pipe.cfg, 'init_oversample', 1.6)):g}), tighten the prior, "
+            f"{float(getattr(pipe.cfg, 'init_oversample', 2.0)):g}), tighten the prior, "
             "or raise count_max. This is a systemic prior/config problem, not a few hard "
             "corners.")
 
@@ -973,11 +995,10 @@ def _init_state(pipe: Pipeline, U, target_n: Optional[int] = None):
                 "UNCAPPED -- bounded by the cold count_max)")
     out = pipe._init_mv_jit(U_keep, Y, refs)
     jax.block_until_ready(out[0])
-    if len(out) == 7:                      # real pipelines: init eval threads ACC
-        L, G, Y, refs, n_bad, DY, ACC2 = out
-        acc2_np = np.asarray(jax.device_get(ACC2), np.int64)
-    else:                                  # stub pipelines: no accept-count concept
-        L, G, Y, refs, n_bad, DY = out
+    L, G, Y, refs, n_bad, DY, tail = out
+    if has_diag:      # real pipelines: batch_eval_init_vg threads per-particle ACC
+        acc2_np = np.asarray(jax.device_get(tail), np.int64)
+    else:             # stub pipelines: tail is the (always-0) n_capped scalar
         acc2_np = None
     n_bad = int(jax.device_get(n_bad))
     if n_bad > 0:
@@ -1025,14 +1046,32 @@ def _init_state(pipe: Pipeline, U, target_n: Optional[int] = None):
         raise RuntimeError("non-finite gradient entries at initialization")
     logger.info(f"init 2/2 done in {time.perf_counter() - t0:.1f}s "
                 f"(kept {target_n}/{n_phase2})")
-    return U_keep, L, G, Y, refs, DY
+    # Structured record of the operational-prior support measurement: these counts
+    # define p(theta | forward model evaluates) relative to the declared prior and
+    # feed the evidence conditioning report -- they must survive the run (results +
+    # checkpoint), not just the log (which rotates).
+    init_stats = dict(
+        n_drawn=int(M),
+        n_alive_phase1=int(n_alive),
+        n_exhausted=int(exhausted.sum()),
+        n_nonfinite=int((nonfinite & ~exhausted).sum()),
+        n_phase2=int(n_phase2),
+        n_recert_fail=int(np.asarray(recert_fail).sum()),
+    )
+    return U_keep, L, G, Y, refs, DY, init_stats
 
 
 def _make_mutation(pipe: Pipeline, n_mcmc: int):
     """Build the jitted state-carrying mutation:
 
         mutate(key, U, Y, refs, L, G, DY, beta, step, scale)
-            -> (U, Y, refs, L, G, DY, mean_acceptance, n_bad_grad)
+            -> (U, Y, refs, L, G, DY, mean_acceptance, n_bad_grad, n_warm_capped)
+
+    ``n_warm_capped`` totals the proposals rejected specifically because their warm
+    solve hit warm_count_max (a subset of all rejections). It is surfaced per sweep
+    (heartbeat) and per stage because a frequently-binding, possibly state-dependent
+    cap is a detailed-balance risk the MH correction does not see -- keep it ~0 in
+    the late ladder or drop warm_count_max back toward count_max.
 
     runs `n_mcmc` preconditioned-MALA sweeps over the particle cloud. Every
     proposal's chemistry warm-starts from the particle's carried converged column Y
@@ -1073,9 +1112,13 @@ def _make_mutation(pipe: Pipeline, n_mcmc: int):
     theta_from_u = pipe.theta_from_u
     n_ct = int(getattr(pipe, "n_chem_tp", 0))
 
-    def _heartbeat(s_idx, acc_mean, n_rej, n_bad, n_prop):
+    def _heartbeat(s_idx, acc_mean, n_rej, n_capped, n_bad, n_prop):
+        # warmcap = proposals cut off at warm_count_max (a subset of rejected):
+        # the MH correction cannot account for a state-dependent cap, so this
+        # count must stay near zero in the converged-ladder stages -- watch it.
         logger.info(f"    sweep {int(s_idx) + 1}/{n_mcmc}: accept={float(acc_mean):.2f} "
-                    f"rejected={int(n_rej)}/{int(n_prop)} n_bad_grad={int(n_bad)}")
+                    f"rejected={int(n_rej)}/{int(n_prop)} warmcap={int(n_capped)} "
+                    f"n_bad_grad={int(n_bad)}")
 
     def mutate(key, U, Y, refs, L, G, DY, beta, step, scale):
         def dlogprior(U_):
@@ -1094,10 +1137,11 @@ def _make_mutation(pipe: Pipeline, n_mcmc: int):
                 C_new = jax.vmap(theta_from_u)(U_new)[:, :n_ct]
                 Y_seed = jnp.maximum(
                     Y + jnp.einsum("nkij,nk->nij", DY, C_new - C_cur), 0.0)
-                L_new, G_new, Y_new, refs_new, n_bad, DY_new = move_vg(
+                L_new, G_new, Y_new, refs_new, n_bad, DY_new, n_capped = move_vg(
                     U_new, Y_seed, C_new[:, :2])
             else:
-                L_new, G_new, Y_new, refs_new, n_bad, DY_new = move_vg(U_new, Y, refs)
+                L_new, G_new, Y_new, refs_new, n_bad, DY_new, n_capped = move_vg(
+                    U_new, Y, refs)
             GT_new = dlogprior(U_new) + beta * G_new
             # asymmetric MH correction for the preconditioned Langevin proposal
             df = (U_new - U - step * (scale * scale) * GT) / scale
@@ -1120,20 +1164,21 @@ def _make_mutation(pipe: Pipeline, n_mcmc: int):
             # per-sweep progress line (host-side, async): a count_max-gated slow sweep
             # is visible as it happens instead of after hours of silence
             n_rej = jnp.sum((L_new <= -1.0e29).astype(jnp.int32))
-            jax.debug.callback(_heartbeat, s_idx, jnp.mean(acc), n_rej, n_bad,
-                               jnp.asarray(U.shape[0], jnp.int32))
-            return U, Y, refs, L, G, DY, acc, n_bad
+            jax.debug.callback(_heartbeat, s_idx, jnp.mean(acc), n_rej, n_capped,
+                               n_bad, jnp.asarray(U.shape[0], jnp.int32))
+            return U, Y, refs, L, G, DY, acc, n_bad, n_capped
 
         def body(carry, xs):
             k, s_idx = xs
             U, Y, refs, L, G, DY = carry
-            U, Y, refs, L, G, DY, acc, n_bad = sweep(k, s_idx, U, Y, refs, L, G, DY)
-            return (U, Y, refs, L, G, DY), (jnp.mean(acc), n_bad)
+            U, Y, refs, L, G, DY, acc, n_bad, n_capped = sweep(
+                k, s_idx, U, Y, refs, L, G, DY)
+            return (U, Y, refs, L, G, DY), (jnp.mean(acc), n_bad, n_capped)
 
         keys = jax.random.split(key, n_mcmc)
-        (U, Y, refs, L, G, DY), (accs, n_bads) = jax.lax.scan(
+        (U, Y, refs, L, G, DY), (accs, n_bads, n_capps) = jax.lax.scan(
             body, (U, Y, refs, L, G, DY), (keys, jnp.arange(n_mcmc)))
-        return U, Y, refs, L, G, DY, jnp.mean(accs), jnp.sum(n_bads)
+        return U, Y, refs, L, G, DY, jnp.mean(accs), jnp.sum(n_bads), jnp.sum(n_capps)
 
     return jax.jit(mutate)
 
@@ -1160,14 +1205,14 @@ def tune_step_size(pipe: Pipeline, key) -> float:
     scale = jnp.ones((pipe.n_dim,), dtype=dtype)
     key, sub = jax.random.split(key)
     U = pipe.sample_prior_u(sub, _init_draw_count(pipe, n_p))
-    U, L, G, Y, refs, DY = _init_state(pipe, U, target_n=n_p)
+    U, L, G, Y, refs, DY, _init_stats = _init_state(pipe, U, target_n=n_p)
     mutate = _make_mutation(pipe, int(cfg.mcmc_tune_steps))
     log_step = math.log(min(max(float(cfg.mala_step_size), cfg.mcmc_step_size_min), cfg.mcmc_step_size_max))
     target = float(cfg.mcmc_target_accept_mala)
     for it in range(int(cfg.mcmc_tune_iters)):
         key, sub = jax.random.split(key)
-        U, Y, refs, L, G, DY, acc, n_bad = mutate(sub, U, Y, refs, L, G, DY, beta,
-                                                  jnp.asarray(math.exp(log_step), dtype), scale)
+        U, Y, refs, L, G, DY, acc, n_bad, _ncap = mutate(sub, U, Y, refs, L, G, DY, beta,
+                                                         jnp.asarray(math.exp(log_step), dtype), scale)
         _check_mutation_health(n_bad, f"step-size tuning iteration {it}")
         acc_f = float(jax.device_get(acc))
         log_step += float(cfg.mcmc_tune_gain) * (acc_f - target)
@@ -1182,9 +1227,17 @@ def run_smc_loop(pipe: Pipeline, key, progress: bool = True,
                  walltime_seconds: float = 0.0,
                  resume_from: Optional[Path] = None) -> Dict[str, Any]:
     """Adaptive-tempered SMC to beta=1. Checkpoints after every stage; stops cleanly if
-    the wall-clock budget is exceeded (partial output is always usable). Pass
-    ``resume_from=<checkpoint.npz>`` to continue a killed run from its tempered cloud
-    (the ladder resumes at the checkpointed beta; already-completed stages are kept)."""
+    the wall-clock budget is exceeded (partial output is always usable -- but flagged:
+    a beta<1 stop yields TEMPERED draws, and every export/plot path labels them so).
+    Pass ``resume_from=<checkpoint.npz>`` to continue a killed run from its tempered
+    cloud (the ladder resumes at the checkpointed beta; completed stages are kept).
+
+    EVIDENCE SEMANTICS: the returned ``logZ`` is the evidence under the OPERATIONAL
+    prior -- the declared box restricted to the modelable T-P window and to draws
+    whose chemistry converges (init reject-and-cull), renormalized. The measured
+    support fraction and the box-prior value logZ_box = logZ + ln(f_support)
+    (non-evaluable region assigned zero likelihood) ride along in the results; never
+    compare logZ across models with different support fractions without them."""
     cfg = pipe.cfg
     dtype = pipe.dtype
     N = int(cfg.smc_num_particles)
@@ -1208,7 +1261,9 @@ def run_smc_loop(pipe: Pipeline, key, progress: bool = True,
     beta = 0.0
     betas: List[float] = [0.0]
     ess_hist, acc_hist, logz_inc_hist, step_hist, uniq_hist = [], [], [], [], []
+    capped_hist: List[int] = []
     logZ = 0.0
+    init_stats: Optional[Dict[str, int]] = None
 
     state_loaded = False
     if resume_from is not None and Path(resume_from).exists():
@@ -1226,6 +1281,11 @@ def run_smc_loop(pipe: Pipeline, key, progress: bool = True,
         uniq_hist = [int(x) for x in ck["unique_particles"]]
         logZ = float(ck["logZ"])
         scale = np.asarray(ck["scale_diag"], np.float64)
+        if "warm_capped" in ck.files:
+            capped_hist = [int(x) for x in ck["warm_capped"]]
+        if "init_stats_keys" in ck.files:
+            init_stats = {str(k): int(v) for k, v in
+                          zip(ck["init_stats_keys"], ck["init_stats_vals"])}
         if step_hist:
             log_step = math.log(min(max(step_hist[-1], cfg.mcmc_step_size_min), cfg.mcmc_step_size_max))
         if all(k in ck.files for k in ("y_state", "chem_refs", "loglik", "grad_u")):
@@ -1253,8 +1313,13 @@ def run_smc_loop(pipe: Pipeline, key, progress: bool = True,
         # one batched cold two-stage solve per particle: the ONLY solve-from-baseline
         # work in the whole run (every mutation proposal warm-continues from here)
         t0 = time.perf_counter()
-        U, L, G, Y, refs, DY = _init_state(pipe, U, target_n=N)
+        U, L, G, Y, refs, DY, init_stats = _init_state(pipe, U, target_n=N)
         jax.block_until_ready(L)
+        # fold the T-P-window rejection tally in so init_stats fully describes the
+        # operational prior p(theta | window valid AND chemistry converges)
+        tp_stats = dict(getattr(pipe, "tp_prior_stats", {}) or {})
+        init_stats["tp_n_drawn"] = int(tp_stats.get("n_drawn", 0))
+        init_stats["tp_n_kept"] = int(tp_stats.get("n_kept", 0))
         logger.info(f"Initialized particle state (cold likelihood + move-map gradient) "
                     f"in {time.perf_counter()-t0:.1f}s")
 
@@ -1304,13 +1369,15 @@ def run_smc_loop(pipe: Pipeline, key, progress: bool = True,
             scale = _abs_scale_diag(np.asarray(jax.device_get(U)), cap=float(cfg.mcmc_scale_clip))
         # (4) mutate at the new temperature
         key, sub = jax.random.split(key)
-        U, Y, refs, L, G, DY, acc, n_bad = mutate(sub, U, Y, refs, L, G, DY,
-                                                  jnp.asarray(beta_new, dtype),
-                                                  jnp.asarray(math.exp(log_step), dtype),
-                                                  jnp.asarray(scale, dtype))
+        U, Y, refs, L, G, DY, acc, n_bad, n_capped = mutate(
+            sub, U, Y, refs, L, G, DY,
+            jnp.asarray(beta_new, dtype),
+            jnp.asarray(math.exp(log_step), dtype),
+            jnp.asarray(scale, dtype))
         jax.block_until_ready(U)
         _check_mutation_health(n_bad, f"SMC stage {i} (beta={beta_new:.3e})")
         acc_f = float(jax.device_get(acc))
+        n_capped_f = int(jax.device_get(n_capped))
         U_np = np.asarray(jax.device_get(U), np.float64)
         n_uniq = int(np.unique(np.round(U_np, 9), axis=0).shape[0])
         # (5) Robbins-Monro step-size trim toward the target acceptance (fine-tuning
@@ -1322,12 +1389,13 @@ def run_smc_loop(pipe: Pipeline, key, progress: bool = True,
         beta = beta_new
         betas.append(beta); ess_hist.append(ess); acc_hist.append(acc_f)
         logz_inc_hist.append(logZ_inc); step_hist.append(math.exp(log_step)); uniq_hist.append(n_uniq)
+        capped_hist.append(n_capped_f)
         elapsed = time.perf_counter() - t_start
         if hasattr(it, "set_postfix"):
             it.set_postfix(beta=f"{beta:.2e}", ess=f"{ess:.0f}", acc=f"{acc_f:.2f}")
         logger.info(f"SMC {i:03d}: beta={beta:.3e} ESS={ess:.1f}/{N} accept={acc_f:.3f} "
                     f"unique={n_uniq}/{N} step={math.exp(log_step):.3g} logZ={logZ:.2f} "
-                    f"elapsed={elapsed/60:.1f}min")
+                    f"warmcap={n_capped_f} elapsed={elapsed/60:.1f}min")
 
         if checkpoint_path is not None:
             theta_ck = np.asarray(jax.device_get(jax.vmap(pipe.theta_from_u)(U)), np.float64)
@@ -1336,8 +1404,12 @@ def run_smc_loop(pipe: Pipeline, key, progress: bool = True,
                      betas=np.asarray(betas), ess=np.asarray(ess_hist),
                      acceptance_rate=np.asarray(acc_hist), logZ_increment=np.asarray(logz_inc_hist),
                      step_size_history=np.asarray(step_hist), unique_particles=np.asarray(uniq_hist, np.int64),
+                     warm_capped=np.asarray(capped_hist, np.int64),
                      scale_diag=np.asarray(scale), last_step=np.asarray(i, np.int64),
                      logZ=np.asarray(logZ),
+                     **({"init_stats_keys": np.asarray(list(init_stats.keys())),
+                         "init_stats_vals": np.asarray(list(init_stats.values()), np.int64)}
+                        if init_stats else {}),
                      # carried per-particle state: resume warm-continues without re-init
                      y_state=np.asarray(jax.device_get(Y), np.float64),
                      chem_refs=np.asarray(jax.device_get(refs), np.float64),
@@ -1356,17 +1428,59 @@ def run_smc_loop(pipe: Pipeline, key, progress: bool = True,
 
     reached = beta >= 1.0 - 1e-6
     # posterior draws: at beta=1 particles are equally weighted; sample with replacement.
+    # When the ladder stopped early (walltime) these are TEMPERED (beta<1) draws, NOT
+    # posterior samples -- reached_beta1/final_beta travel with every output and the
+    # plotting/export paths must (and do) refuse the "posterior" label without them.
     n_draws = int(cfg.num_chains) * int(cfg.num_samples)
     key, sub = jax.random.split(key)
     draw_idx = np.asarray(jax.device_get(jax.random.choice(sub, N, (n_draws,), replace=True)))
     theta_draws = np.asarray(jax.device_get(jax.vmap(pipe.theta_from_u)(U)), np.float64)[draw_idx]
     theta_draws = theta_draws.reshape(int(cfg.num_chains), int(cfg.num_samples), n_dim)
 
+    # ---- evidence conditioning report -------------------------------------
+    # The tempering accumulates logZ over particles drawn from the OPERATIONAL prior:
+    # the declared box restricted to (a) the modelable T-P window and (b) draws whose
+    # chemistry converges (init reject-and-cull). `logZ` is therefore the evidence
+    # under that conditioned, RENORMALIZED prior. The support fraction f =
+    # f_tp x f_converge is measured from the init sampling (binomial estimates);
+    # logZ_box = logZ + ln(f) is the evidence under the declared box prior WITH the
+    # non-evaluable region assigned zero likelihood. Report logZ only together with
+    # these numbers, and never compare logZ across models whose support fractions
+    # differ without applying the correction.
+    def _binom(k, n):
+        if n <= 0:
+            return 1.0, 0.0
+        f = max(k / n, 1.0 / (2.0 * n))          # floor so ln(f) stays finite
+        se = math.sqrt(max(f * (1.0 - f), 0.0) / n) / f   # d ln f
+        return f, se
+    if init_stats:
+        f_tp, se_tp = _binom(init_stats.get("tp_n_kept", 0), init_stats.get("tp_n_drawn", 0))
+        f_c1, se_c1 = _binom(init_stats.get("n_alive_phase1", 0), init_stats.get("n_drawn", 0))
+        n_p2 = init_stats.get("n_phase2", 0)
+        f_c2, se_c2 = _binom(n_p2 - init_stats.get("n_recert_fail", 0), n_p2)
+        log_support = math.log(f_tp) + math.log(f_c1) + math.log(f_c2)
+        log_support_err = math.sqrt(se_tp**2 + se_c1**2 + se_c2**2)
+        logger.info(
+            f"evidence conditioning: operational-prior support fraction "
+            f"f = {math.exp(log_support):.3f} (T-P window {f_tp:.3f} x cold-converge "
+            f"{f_c1:.3f} x warm-recert {f_c2:.3f}); logZ(conditioned) = {logZ:.2f}, "
+            f"logZ(box, non-evaluable=0) = {logZ + log_support:.2f} "
+            f"+/- {log_support_err:.2f} (support term only)")
+    else:
+        log_support, log_support_err = float("nan"), float("nan")
+        logger.warning("evidence conditioning: no init_stats available (old resume "
+                       "checkpoint) -- the operational-prior support fraction is "
+                       "unknown; do NOT quote logZ as a box-prior evidence.")
+
     return dict(
         U=np.asarray(jax.device_get(U), np.float64), reached_beta1=reached, final_beta=beta,
         step_size_used=math.exp(log_step), betas=np.asarray(betas),
         ess=np.asarray(ess_hist), acceptance_rate=np.asarray(acc_hist),
         logZ_increment=np.asarray(logz_inc_hist), logZ=logZ,
+        log_support_fraction=log_support, log_support_fraction_err=log_support_err,
+        logZ_box=(logZ + log_support) if math.isfinite(log_support) else float("nan"),
+        init_stats=(init_stats or {}),
+        warm_capped=np.asarray(capped_hist, np.int64),
         step_size_history=np.asarray(step_hist), unique_particles=np.asarray(uniq_hist, np.int64),
         scale_diag_final=np.asarray(scale), theta_draws=theta_draws,
     )

@@ -141,7 +141,11 @@ def main() -> None:
                     p_bar, "k--", lw=1.2, label="truth")
         ax.set_yscale("log"); ax.invert_yaxis()
         ax.set_xlabel("T [K]"); ax.set_ylabel("P [bar]")
-        ax.legend(fontsize=8, frameon=False); ax.set_title("Retrieved Guillot T-P")
+        ax.legend(fontsize=8, frameon=False)
+        # same tempered stamp as corner/spectrum: this band is NOT a posterior band
+        # when the ladder stopped at beta<1 (this figure used to be the one unstamped
+        # headline panel)
+        ax.set_title("Retrieved Guillot T-P" + tempered_tag, fontsize=9)
         fig.tight_layout(); fig.savefig(plots / "tp_posterior.png", dpi=DPI); plt.close(fig)
         print("[plot] tp_posterior.png")
 
@@ -174,7 +178,13 @@ def main() -> None:
                 "s-", ms=2.5, color="#9467bd", alpha=0.7)
         a2.set_ylabel("cumulative logZ")
         a.set_title("diversity + evidence"); a.legend(fontsize=8, loc="lower left")
-        fig.suptitle(f"SMC diagnostics (reached beta=1: {bool(int(x['reached_beta1']))})", fontsize=11)
+        sup = ""
+        if ("smc_log_support_fraction" in x.files
+                and np.isfinite(float(x["smc_log_support_fraction"]))):
+            sup = (f" | prior support f={np.exp(float(x['smc_log_support_fraction'])):.2f} "
+                   f"(logZ conditioned; box {float(x['smc_logZ_box']):.1f})")
+        fig.suptitle(f"SMC diagnostics (reached beta=1: {bool(int(x['reached_beta1']))})"
+                     f"{sup}", fontsize=11)
         fig.tight_layout(); fig.savefig(plots / "smc_diagnostics.png", dpi=DPI); plt.close(fig)
         print("[plot] smc_diagnostics.png")
 

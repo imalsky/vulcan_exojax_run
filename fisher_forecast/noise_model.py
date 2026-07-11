@@ -30,6 +30,7 @@ round representative numbers. Calibrate against PandExo for real proposals.
 """
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import numpy as np
@@ -151,14 +152,15 @@ def pandexo_grid(npz_path):
 # --- REAL published spectra (most realistic noise: the actually-achieved error bars) ---
 # ASCII columns are wavelength_um, transit_depth_ppm, err_ppm, optionally followed by
 # wavelength_low_um, wavelength_high_um. Lines beginning with '#' are comments.
-OBS_W39B_PRISM = ("/Users/imalsky/Desktop/Emulators/VULCAN_Project/"
-                  "vulcan_exojax_run/data/wasp39b_prism.txt")  # Rustamkulov+2023 FIREFLy, Zenodo 7388032
+_OBSDIR = str(Path(os.environ.get(
+    "VULCAN_PROJECT_ROOT", "/Users/imalsky/Desktop/Emulators/VULCAN_Project"))
+    / "vulcan_exojax_run" / "data")
+OBS_W39B_PRISM = _OBSDIR + "/wasp39b_prism.txt"  # Rustamkulov+2023 FIREFLy, Zenodo 7388032
 
 # Per-mode real WASP-39b spectra. The benchmark set (Carter+2024, uniform Eureka!
 # reduction, Zenodo 10161743) is apples-to-apples across modes -> use it for the
 # cross-instrument comparison. The FIREFLy PRISM stays the headline anchor.
 # Written by fetch_benchmark_spectra.py.
-_OBSDIR = "/Users/imalsky/Desktop/Emulators/VULCAN_Project/vulcan_exojax_run/data"
 OBS_W39B = {
     "PRISM_firefly": OBS_W39B_PRISM,
     "PRISM":  _OBSDIR + "/wasp39b_bench_PRISM.txt",

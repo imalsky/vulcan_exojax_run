@@ -124,8 +124,12 @@ def main():
         try:
             out[key] = _one_mode(build_default_calc, perform_calculation,
                                  m, job["star"], float(job.get("sat_limit", 0.8)))
-            print(f"[pandeia] {key}: ngroup={out[key]['ngroup']} "
-                  f"sat={out[key]['sat_frac']:.2f} npix={len(out[key]['wl'])}", flush=True)
+            if out[key].get("unusable"):
+                print(f"[pandeia] {key}: UNUSABLE ({out[key]['reason']})", flush=True)
+            else:
+                print(f"[pandeia] {key}: ngroup={out[key]['ngroup']} "
+                      f"sat={out[key]['sat_frac']:.2f} npix={len(out[key]['wl'])}",
+                      flush=True)
         except Exception:
             out[key] = {"error": traceback.format_exc()}
             print(f"[pandeia] {key}: FAILED", flush=True)

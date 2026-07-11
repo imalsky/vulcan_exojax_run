@@ -11,7 +11,8 @@ pure-numpy Fisher figures (scripts/zco_lib.py + fig_zco_*.py).
 
 The three tiers share ONE ExoJax opacity build (RT depends only on the molecule set +
 grid, not the chemistry); only the VULCAN-JAX chemistry config differs:
-    E : use_photo=False, Kzz->0, use_moldiff=False   (local thermochemical equilibrium)
+    E : use_photo=False, Kzz->0, use_moldiff=False   (no-transport kinetic fixed point,
+        approximately local thermochemical equilibrium; ~3% element drift, see below)
     Q : use_photo=False                              (+ vertical transport => quenching)
     P : use_photo=True                               (+ photochemistry; the fiducial)
 
@@ -61,7 +62,7 @@ TIER_CFG = {
     "P": dict(use_photo=True),
 }
 TIER_ORDER = ["E", "Q", "P"]
-TIER_NAME = {"E": "equilibrium", "Q": "quench(+transport)", "P": "photochem(+photo)"}
+TIER_NAME = {"E": "no-transport (~equilibrium)", "Q": "quench(+transport)", "P": "photochem(+photo)"}
 
 
 def _profile(smoke: bool, tier: str) -> dict:
@@ -84,6 +85,7 @@ def build_tier(tier: str, trt, smoke: bool):
     to_art = interp_map.make_to_art(chem.p_bar, trt.p_art_bar)
     mol_cols = {k: chem.sidx[config.MOLECULES[k]["vulcan"]] for k in trt.molecules}
     h2 = chem.sidx[config.BULK_H2_VULCAN]
+    he = chem.sidx["He"]        # H2-He CIA partner (required by the RT)
     T_base = jnp.asarray(chem.T_base)
     masses = chem.species_masses
 
@@ -93,7 +95,8 @@ def build_tier(tier: str, trt, smoke: bool):
         mmw_art = to_art(ymix @ masses)
         vmr = {k: to_art(ymix[:, c]) for k, c in mol_cols.items()}
         vmr_h2 = to_art(ymix[:, h2])
-        return (vmr, vmr_h2, T_art, mmw_art)
+        vmr_he = to_art(ymix[:, he])
+        return (vmr, vmr_h2, T_art, mmw_art, vmr_he)
 
     def trans_of(gg):
         return trt.transmission_depth(*gg)
@@ -117,8 +120,12 @@ def build_tier(tier: str, trt, smoke: bool):
     J_chem = np.stack(Jc, axis=1)
 
     # lnR0 column: RT-only jvp of the reference-radius-scaled depth at this tier's g0.
+    # g0 is (vmr, vmr_h2, T_art, mmw_art, vmr_he) -- unpack explicitly: a bare *g0
+    # splat would land vmr_he in the positional lnR0 slot.
     def trans_r(lnR0):
-        return trt.transmission_depth_r(*g0, lnR0)
+        vmr_, vmr_h2_, T_art_, mmw_art_, vmr_he_ = g0
+        return trt.transmission_depth_r(vmr_, vmr_h2_, T_art_, mmw_art_, lnR0,
+                                        vmr_he=vmr_he_)
     _, dR = jax.jvp(trans_r, (jnp.float64(0.0),), (jnp.float64(1.0),))
     J_lnR0 = np.asarray(dR)
     print(f"  d/dlnR0 finite={np.all(np.isfinite(J_lnR0))} max|.|={np.nanmax(np.abs(J_lnR0)):.2e}"

@@ -16,8 +16,21 @@ rolling our own:
 
 ``build_tp_model(cfg)`` returns an object whose ``eval(tp_params, p_bar_grid)`` maps the
 *retrieved* T-P sub-vector + the fixed constants to a temperature array on ANY pressure
-grid (bar). The retrieval evaluates it on both the VULCAN grid (for chemistry) and the
-ExoJax ART grid (for the RT), guaranteeing one self-consistent profile.
+grid (bar). The retrieval evaluates the SAME analytic curve on both the VULCAN grid (for
+chemistry) and the ExoJax ART grid (for the RT), so the two sides sample one T(P)
+function. Scope of that consistency, stated precisely:
+  * the chemistry side rebuilds the rate table AND the T/composition-dependent
+    atmospheric structure (hydrostatic geometry via the runner's in-loop refresh +
+    seeded initial carry, Dzz/vm/vs on-graph) from this T(P) -- see vulcan_chem;
+    the photolysis cross-section T-interpolation remains baked at the baseline T
+    (host-side upstream step; a documented second-order approximation);
+  * the ExoJax side builds its own hydrostatic transit geometry from the SAME T(P)
+    and the chemistry MMW, interpolated per interp_map (constant-VMR clamp above the
+    chemistry top, reported loudly at build).
+Physical interpretation caveat: cfg.tp_f defaults to 1/4, the GLOBAL-average
+irradiation convention -- an analytic-shape choice, not a terminator measurement, so
+retrieved (Tirr, kappa, gamma) are flexible shape parameters of the limb profile
+rather than literal disk-average properties.
 
 Import order: ``vulcan_chem`` (which sets env + jax x64) must be imported before this,
 because ExoJax is imported lazily inside ``build_tp_model``.
